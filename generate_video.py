@@ -27,14 +27,17 @@ DATA_DIR = os.path.join(SCRIPT_DIR, "data")
 DEFAULT_COUNTRY = "Germany"
 
 # Video settings
-WIDTH = 1920
-HEIGHT = 1080
+WIDTH = 3840
+HEIGHT = 2160
 FPS = 60
+
+# UI scale relative to 1080p baseline
+UI_SCALE = min(WIDTH / 1920, HEIGHT / 1080)
 
 # Sea level settings
 SEA_LEVEL_MIN = 0
-SEA_LEVEL_MAX = 200
-SEA_LEVEL_STEP = 1  # meters per frame
+SEA_LEVEL_MAX = 1000
+SEA_LEVEL_STEP = 0.5  # meters per frame
 
 # Color scheme
 OCEAN_COLOR_DEEP = [40, 80, 160]
@@ -59,6 +62,13 @@ TERRAIN_COLORS = [
 ]
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Land appearance tuning
+LAND_BRIGHTNESS = 2.00  # 1.0 = unchanged
+LAND_SATURATION = 1.20  # 1.0 = unchanged
+
+# Supersampling factor for resize (1.0 = off, higher = smoother, slower)
+SUPERSAMPLE = 1.0
 
 def slugify(name):
     value = name.strip().lower()
@@ -199,6 +209,7 @@ def compute_hillshade_gpu(dem_np):
 
 def load_fonts():
     """Load fonts once."""
+    scale = UI_SCALE
     font_paths = [
         "C:/Windows/Fonts/segoeuib.ttf",
         "C:/Windows/Fonts/arialbd.ttf",
@@ -207,9 +218,9 @@ def load_fonts():
     for fp in font_paths:
         if os.path.exists(fp):
             try:
-                return (ImageFont.truetype(fp, 72),
-                        ImageFont.truetype(fp, 32),
-                        ImageFont.truetype(fp, 18))
+                return (ImageFont.truetype(fp, int(72 * scale)),
+                        ImageFont.truetype(fp, int(32 * scale)),
+                        ImageFont.truetype(fp, int(18 * scale)))
             except Exception:
                 continue
     f = ImageFont.load_default()
@@ -220,19 +231,21 @@ def draw_text_on_frame(frame_img, sea_level, fonts):
     """Draw text overlay directly on an RGB PIL Image (no RGBA overhead)."""
     font_large, font_small, small_font = fonts
     draw = ImageDraw.Draw(frame_img)
+    s = UI_SCALE
 
     text = f"{int(sea_level)} m"
-    x, y = 50, 30
-    draw.text((x + 3, y + 3), text, font=font_large, fill=(0, 0, 0))
+    x, y = int(50 * s), int(30 * s)
+    shadow = max(1, int(3 * s))
+    draw.text((x + shadow, y + shadow), text, font=font_large, fill=(0, 0, 0))
     draw.text((x, y), text, font=font_large, fill=(255, 255, 255))
 
     label = "Sea Level"
-    draw.text((x + 3, y + 82), label, font=font_small, fill=(0, 0, 0))
-    draw.text((x, y + 80), label, font=font_small, fill=(220, 220, 220))
+    draw.text((x + shadow, y + int(82 * s) + shadow), label, font=font_small, fill=(0, 0, 0))
+    draw.text((x, y + int(80 * s)), label, font=font_small, fill=(220, 220, 220))
 
-    bar_y = HEIGHT - 40
-    bar_h = 8
-    bar_margin = 50
+    bar_y = HEIGHT - int(40 * s)
+    bar_h = max(2, int(8 * s))
+    bar_margin = int(50 * s)
     bar_width = WIDTH - 2 * bar_margin
     progress = sea_level / SEA_LEVEL_MAX
 
@@ -244,11 +257,12 @@ def draw_text_on_frame(frame_img, sea_level, fonts):
     tick_step = 250
     for lv in range(0, SEA_LEVEL_MAX + 1, tick_step):
         lx = bar_margin + int(bar_width * (lv / SEA_LEVEL_MAX))
-        draw.line([(lx, bar_y - 4), (lx, bar_y + bar_h + 4)], fill=(150, 150, 150), width=1)
+        tick = max(1, int(4 * s))
+        draw.line([(lx, bar_y - tick), (lx, bar_y + bar_h + tick)], fill=(150, 150, 150), width=max(1, int(1 * s)))
         lt = f"{lv}m"
         bbox = draw.textbbox((0, 0), lt, font=small_font)
         tw = bbox[2] - bbox[0]
-        draw.text((lx - tw // 2, bar_y + bar_h + 6), lt, font=small_font, fill=(180, 180, 180))
+        draw.text((lx - tw // 2, bar_y + bar_h + int(6 * s)), lt, font=small_font, fill=(180, 180, 180))
 
 
 def precompute_scaled_dims(dem_shape):
@@ -279,6 +293,16 @@ def render_frame_gpu(dem_gpu, is_nodata_gpu, sea_level, terrain_lut_gpu,
     land_elev = torch.clamp(dem_gpu - sea_level, 0, 3000).to(torch.int64)
     land_elev[~is_land] = 0
     img[is_land] = terrain_lut_gpu[land_elev[is_land]].float()
+    if LAND_BRIGHTNESS != 1.0 or LAND_SATURATION != 1.0:
+        land_rgb = img[is_land]
+        if LAND_SATURATION != 1.0:
+            luma = (land_rgb[:, 0] * 0.2126 +
+                    land_rgb[:, 1] * 0.7152 +
+                    land_rgb[:, 2] * 0.0722).unsqueeze(1)
+            land_rgb = luma + (land_rgb - luma) * LAND_SATURATION
+        if LAND_BRIGHTNESS != 1.0:
+            land_rgb = land_rgb * LAND_BRIGHTNESS
+        img[is_land] = land_rgb
 
     # Flooded areas
     if torch.any(is_flooded):
@@ -321,6 +345,9 @@ def parse_args():
                         help="Country name (must match Natural Earth, e.g. Germany).")
     parser.add_argument("--dem", default=None, help="Path to clipped DEM .tif (overrides --country).")
     parser.add_argument("--output", default=None, help="Output video path (.mp4).")
+    parser.add_argument("--preview", default=None, help="Write a single PNG preview and exit.")
+    parser.add_argument("--preview-level", type=float, default=None,
+                        help="Sea level for preview in meters (default: SEA_LEVEL_MIN).")
     return parser.parse_args()
 
 
@@ -334,7 +361,8 @@ def main():
         dem_base = os.path.splitext(os.path.basename(args.dem))[0]
         dem_tag = slugify(dem_base.replace("_dem_clipped", ""))
     output_video = args.output or os.path.join(SCRIPT_DIR, f"sea_level_rise_{dem_tag}.mp4")
-
+    preview_path = args.preview
+    preview_level = args.preview_level
     print(f"=== Sea Level Rise Visualization - {country_name} (GPU) ===\n")
     print(f"Device: {DEVICE}")
     if DEVICE.type == "cuda":
@@ -343,6 +371,8 @@ def main():
         print(f"VRAM: {mem_gb:.1f} GB")
     print(f"DEM: {dem_path}")
     print(f"Output: {output_video}")
+    if preview_path:
+        print(f"Preview: {preview_path}")
     print()
 
     # Load data
@@ -396,6 +426,47 @@ def main():
     bg_frame = Image.new('RGB', (WIDTH, HEIGHT), tuple(OCEAN_COLOR_DEEP))
     bg_array = np.array(bg_frame)
 
+    def resize_to_frame(img_gpu):
+        img_chw = img_gpu.permute(2, 0, 1).unsqueeze(0)
+        if SUPERSAMPLE > 1.0:
+            ss_w = max(1, int(new_w * SUPERSAMPLE))
+            ss_h = max(1, int(new_h * SUPERSAMPLE))
+            img_resized = F.interpolate(
+                img_chw, size=(ss_h, ss_w),
+                mode='bicubic', align_corners=False
+            )
+            img_resized = F.interpolate(
+                img_resized, size=(new_h, new_w),
+                mode='bicubic', align_corners=False, antialias=True
+            )
+        else:
+            img_resized = F.interpolate(
+                img_chw, size=(new_h, new_w),
+                mode='bicubic', align_corners=False, antialias=True
+            )
+        img_resized = img_resized.squeeze(0).permute(1, 2, 0)
+        return img_resized.to(torch.uint8).cpu().numpy()
+
+    if preview_path:
+        sl = float(SEA_LEVEL_MIN if preview_level is None else preview_level)
+
+        img_gpu = render_frame_gpu(
+            dem_gpu, is_nodata_gpu, sl, terrain_lut_gpu,
+            water_mask_gpu, hillshade_gpu, ocean_noise_gpu,
+            shore_t, deep_t, river_t, deep_bg_t
+        )
+
+        img_small = resize_to_frame(img_gpu)
+
+        frame_array = bg_array.copy()
+        frame_array[off_y:off_y + new_h, off_x:off_x + new_w] = img_small
+
+        frame_img = Image.fromarray(frame_array)
+        draw_text_on_frame(frame_img, sl, fonts)
+        frame_img.save(preview_path)
+        print(f"Preview saved to: {preview_path}")
+        return
+
     # Start ffmpeg pipe - write raw RGB frames directly
     print("\nStarting ffmpeg pipe...")
     ffmpeg_cmd = [
@@ -429,11 +500,8 @@ def main():
             shore_t, deep_t, river_t, deep_bg_t
         )
 
-        # GPU resize: (H,W,3) -> (1,3,H,W) for interpolate, then back
-        img_chw = img_gpu.permute(2, 0, 1).unsqueeze(0)  # (1,3,H,W)
-        img_resized = F.interpolate(img_chw, size=(new_h, new_w), mode='bilinear', align_corners=False)
-        img_resized = img_resized.squeeze(0).permute(1, 2, 0)  # (new_h, new_w, 3)
-        img_small = img_resized.to(torch.uint8).cpu().numpy()
+        # Resize to frame
+        img_small = resize_to_frame(img_gpu)
 
         # Compose into 1920x1080 frame
         frame_array = bg_array.copy()
