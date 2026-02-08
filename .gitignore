@@ -1,0 +1,11 @@
+# Data files (large, downloadable)
+data/
+frames/
+
+# Output video
+*.mp4
+
+# Python
+__pycache__/
+*.pyc
+*.npy
