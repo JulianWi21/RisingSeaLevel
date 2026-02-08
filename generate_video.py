@@ -122,9 +122,9 @@ def download_if_missing(filename, url):
     return filepath
 
 
-def load_water_bodies(dem_path, water_tag):
+def load_water_bodies(dem_path, water_tag, data_dir):
     """Load ALL water bodies."""
-    water_raster_path = os.path.join(DATA_DIR, f"water_bodies_{water_tag}.npy")
+    water_raster_path = os.path.join(data_dir, f"water_bodies_{water_tag}.npy")
     if os.path.exists(water_raster_path):
         print("Water body raster already exists, loading...")
         return np.load(water_raster_path)
@@ -355,7 +355,8 @@ def main():
     args = parse_args()
     country_name = args.country
     country_slug = slugify(country_name)
-    dem_path = args.dem or os.path.join(DATA_DIR, f"{country_slug}_dem_clipped.tif")
+    country_dir = os.path.join(DATA_DIR, country_slug)
+    dem_path = args.dem or os.path.join(country_dir, f"{country_slug}_dem_clipped.tif")
     dem_tag = country_slug
     if args.dem:
         dem_base = os.path.splitext(os.path.basename(args.dem))[0]
@@ -363,6 +364,7 @@ def main():
     output_video = args.output or os.path.join(SCRIPT_DIR, f"sea_level_rise_{dem_tag}.mp4")
     preview_path = args.preview
     preview_level = args.preview_level
+    data_dir = os.path.dirname(dem_path)
     print(f"=== Sea Level Rise Visualization - {country_name} (GPU) ===\n")
     print(f"Device: {DEVICE}")
     if DEVICE.type == "cuda":
@@ -380,7 +382,7 @@ def main():
     dem_np, bounds = load_dem_data(dem_path)
 
     print("Loading water bodies...")
-    water_np = load_water_bodies(dem_path, dem_tag)
+    water_np = load_water_bodies(dem_path, dem_tag, data_dir)
 
     print("Creating terrain colormap...")
     terrain_lut_gpu = create_terrain_lut()

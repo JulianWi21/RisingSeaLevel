@@ -46,23 +46,38 @@ def select_country(world, country_name):
     raise ValueError(f"Country '{country_name}' not found in Natural Earth dataset.")
 
 
-def download_country_boundary(country_name, country_slug):
+def select_mainland(country_gdf):
+    """Pick the largest polygon (by area) as mainland."""
+    exploded = country_gdf.explode(index_parts=False).reset_index(drop=True)
+    if exploded.empty:
+        return country_gdf
+    try:
+        areas = exploded.to_crs("EPSG:6933").area
+    except Exception:
+        areas = exploded.area
+    idx = areas.idxmax()
+    return exploded.loc[[idx]].copy()
+
+
+def download_country_boundary(country_name, country_slug, country_dir, mainland=False):
     """Download country boundary from Natural Earth 10m countries."""
-    boundary_file = os.path.join(DATA_DIR, f"{country_slug}_boundary.gpkg")
+    boundary_file = os.path.join(country_dir, f"{country_slug}_boundary.gpkg")
     if os.path.exists(boundary_file):
         print(f"{country_name} boundary already exists, loading...")
         return gpd.read_file(boundary_file)
 
     print("Downloading Natural Earth 10m countries...")
     url = "https://naciscdn.org/naturalearth/10m/cultural/ne_10m_admin_0_countries.zip"
-    zip_path = os.path.join(DATA_DIR, "ne_10m_admin_0_countries.zip")
+    zip_path = os.path.join(country_dir, "ne_10m_admin_0_countries.zip")
 
     urllib.request.urlretrieve(url, zip_path)
     print(f"Download complete. Extracting {country_name}...")
 
     world = gpd.read_file(f"zip://{zip_path}")
     country = select_country(world, country_name).copy()
-    if len(country) > 1:
+    if mainland:
+        country = select_mainland(country)
+    elif len(country) > 1:
         country = gpd.GeoDataFrame(
             {"geometry": [country.geometry.unary_union]}, crs=country.crs
         )
@@ -106,12 +121,12 @@ def download_srtm_tiles():
     return tile_files
 
 
-def download_srtm_via_elevation_api(country_bounds, country_slug):
+def download_srtm_via_elevation_api(country_bounds, country_slug, country_dir):
     """
     Download SRTM data for a country using a direct approach.
     Downloads from CGIAR SRTM 90m (5x5 degree tiles).
     """
-    merged_file = os.path.join(DATA_DIR, f"{country_slug}_srtm.tif")
+    merged_file = os.path.join(country_dir, f"{country_slug}_srtm.tif")
     if os.path.exists(merged_file):
         print("SRTM data already exists.")
         return merged_file
@@ -119,7 +134,7 @@ def download_srtm_via_elevation_api(country_bounds, country_slug):
     # CGIAR SRTM v4.1 tiles covering Germany
     # Tile numbering: col 38-39, row 01-03 cover Europe including Germany
     # Format: srtm_COL_ROW.zip containing srtm_COL_ROW.tif
-    tiles_dir = os.path.join(DATA_DIR, "srtm_tiles")
+    tiles_dir = os.path.join(country_dir, "srtm_tiles")
     os.makedirs(tiles_dir, exist_ok=True)
 
     # CGIAR tile grid: each tile is 5x5 degrees
@@ -209,9 +224,9 @@ def download_srtm_via_elevation_api(country_bounds, country_slug):
     return merged_file
 
 
-def clip_dem_to_country(dem_path, country_gdf, country_slug):
+def clip_dem_to_country(dem_path, country_gdf, country_slug, country_dir):
     """Clip DEM to country boundary."""
-    clipped_file = os.path.join(DATA_DIR, f"{country_slug}_dem_clipped.tif")
+    clipped_file = os.path.join(country_dir, f"{country_slug}_dem_clipped.tif")
     if os.path.exists(clipped_file):
         print("Clipped DEM already exists.")
         return clipped_file
@@ -247,23 +262,27 @@ def clip_dem_to_country(dem_path, country_gdf, country_slug):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Download SRTM and clip to a country boundary.")
     parser.add_argument("--country", default="Germany", help="Country name from Natural Earth (e.g. France).")
+    parser.add_argument("--mainland", action="store_true",
+                        help="Use largest polygon only (e.g. metropolitan France).")
     args = parser.parse_args()
 
     country_name = args.country
     country_slug = slugify(country_name)
+    country_dir = os.path.join(DATA_DIR, country_slug)
+    os.makedirs(country_dir, exist_ok=True)
 
     print("=== Downloading Data for Sea Level Rise Visualization ===\n")
     print(f"Country: {country_name}\n")
 
     # Step 1: Country boundary
-    country = download_country_boundary(country_name, country_slug)
+    country = download_country_boundary(country_name, country_slug, country_dir, mainland=args.mainland)
     print(f"{country_name} bounds: {country.total_bounds}\n")
 
     # Step 2: SRTM elevation data
-    dem_path = download_srtm_via_elevation_api(country.total_bounds, country_slug)
+    dem_path = download_srtm_via_elevation_api(country.total_bounds, country_slug, country_dir)
 
     # Step 3: Clip to country
-    clipped_path = clip_dem_to_country(dem_path, country, country_slug)
+    clipped_path = clip_dem_to_country(dem_path, country, country_slug, country_dir)
 
     print("\n=== Data download complete! ===")
     print(f"Clipped DEM: {clipped_path}")
