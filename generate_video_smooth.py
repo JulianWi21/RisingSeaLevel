@@ -33,7 +33,7 @@ FPS = 60
 
 # Sea level settings
 SEA_LEVEL_MIN = 0
-SEA_LEVEL_MAX = 200
+SEA_LEVEL_MAX = 1000
 SEA_LEVEL_STEP = 1  # meters per frame
 
 # Color scheme
@@ -59,6 +59,10 @@ TERRAIN_COLORS = [
 ]
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Hillshade smoothing (odd kernel size; set to 1 to disable)
+HILLSHADE_SMOOTH_K = 3
+
 
 def slugify(name):
     value = name.strip().lower()
@@ -194,7 +198,12 @@ def compute_hillshade_gpu(dem_np):
     hillshade = (torch.sin(torch.tensor(altitude, device=DEVICE)) * torch.cos(slope) +
                  torch.cos(torch.tensor(altitude, device=DEVICE)) * torch.sin(slope) *
                  torch.cos(torch.tensor(azimuth, device=DEVICE) - aspect))
-    return torch.clamp(hillshade, 0.3, 1.0)
+    hillshade = torch.clamp(hillshade, 0.3, 1.0)
+    if HILLSHADE_SMOOTH_K > 1 and HILLSHADE_SMOOTH_K % 2 == 1:
+        hs = hillshade.unsqueeze(0).unsqueeze(0)
+        hillshade = F.avg_pool2d(hs, kernel_size=HILLSHADE_SMOOTH_K,
+                                 stride=1, padding=HILLSHADE_SMOOTH_K // 2).squeeze()
+    return hillshade
 
 
 def load_fonts():

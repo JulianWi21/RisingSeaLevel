@@ -1,9 +1,11 @@
 """
-Download elevation data (SRTM) and Germany boundary for sea level rise visualization.
-Uses NASA SRTM data via OpenTopography-style direct tile downloads and Natural Earth boundaries.
+Download elevation data (SRTM) and a country boundary for sea level rise visualization.
+Uses NASA SRTM data via direct tile downloads and Natural Earth boundaries.
 """
 
 import os
+import re
+import argparse
 import urllib.request
 import zipfile
 import io
@@ -18,12 +20,37 @@ import geopandas as gpd
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
+def slugify(name):
+    value = name.strip().lower()
+    value = re.sub(r"[^a-z0-9]+", "_", value)
+    value = re.sub(r"_+", "_", value).strip("_")
+    return value or "country"
 
-def download_germany_boundary():
-    """Download Germany boundary from Natural Earth 10m countries."""
-    boundary_file = os.path.join(DATA_DIR, "germany_boundary.gpkg")
+
+def select_country(world, country_name):
+    name_lower = country_name.strip().lower()
+    candidate_cols = ["NAME", "NAME_EN", "ADMIN", "SOVEREIGNT"]
+    for col in candidate_cols:
+        if col in world.columns:
+            series = world[col].fillna("").astype(str).str.lower()
+            matches = world[series == name_lower]
+            if not matches.empty:
+                return matches
+    for col in candidate_cols:
+        if col in world.columns:
+            series = world[col].fillna("").astype(str).str.lower()
+            matches = world[series.str.contains(name_lower)]
+            if not matches.empty:
+                print(f"Warning: using partial match from column {col}")
+                return matches
+    raise ValueError(f"Country '{country_name}' not found in Natural Earth dataset.")
+
+
+def download_country_boundary(country_name, country_slug):
+    """Download country boundary from Natural Earth 10m countries."""
+    boundary_file = os.path.join(DATA_DIR, f"{country_slug}_boundary.gpkg")
     if os.path.exists(boundary_file):
-        print("Germany boundary already exists, loading...")
+        print(f"{country_name} boundary already exists, loading...")
         return gpd.read_file(boundary_file)
 
     print("Downloading Natural Earth 10m countries...")
@@ -31,17 +58,21 @@ def download_germany_boundary():
     zip_path = os.path.join(DATA_DIR, "ne_10m_admin_0_countries.zip")
 
     urllib.request.urlretrieve(url, zip_path)
-    print("Download complete. Extracting Germany...")
+    print(f"Download complete. Extracting {country_name}...")
 
     world = gpd.read_file(f"zip://{zip_path}")
-    germany = world[world['NAME'] == 'Germany'].copy()
-    germany = germany.to_crs("EPSG:4326")
-    germany.to_file(boundary_file, driver="GPKG")
+    country = select_country(world, country_name).copy()
+    if len(country) > 1:
+        country = gpd.GeoDataFrame(
+            {"geometry": [country.geometry.unary_union]}, crs=country.crs
+        )
+    country = country.to_crs("EPSG:4326")
+    country.to_file(boundary_file, driver="GPKG")
 
     # Cleanup
     os.remove(zip_path)
-    print(f"Germany boundary saved to {boundary_file}")
-    return germany
+    print(f"{country_name} boundary saved to {boundary_file}")
+    return country
 
 
 def download_srtm_tiles():
@@ -75,12 +106,12 @@ def download_srtm_tiles():
     return tile_files
 
 
-def download_srtm_via_elevation_api():
+def download_srtm_via_elevation_api(country_bounds, country_slug):
     """
-    Download SRTM data for Germany using a direct approach.
+    Download SRTM data for a country using a direct approach.
     Downloads from CGIAR SRTM 90m (5x5 degree tiles).
     """
-    merged_file = os.path.join(DATA_DIR, "germany_srtm.tif")
+    merged_file = os.path.join(DATA_DIR, f"{country_slug}_srtm.tif")
     if os.path.exists(merged_file):
         print("SRTM data already exists.")
         return merged_file
@@ -91,16 +122,21 @@ def download_srtm_via_elevation_api():
     tiles_dir = os.path.join(DATA_DIR, "srtm_tiles")
     os.makedirs(tiles_dir, exist_ok=True)
 
-    # Germany: ~5-16E, ~47-55.5N
     # CGIAR tile grid: each tile is 5x5 degrees
-    # Starting from -180, -60: col = (lon + 180) / 5 + 1, row = (60 - lat) / 5 + 1
-    # For lon 5: col = 38, lon 10: col = 39, lon 15: col = 40
-    # For lat 55: row = 2, lat 50: row = 3, lat 45: row = 4
+    # col = floor((lon + 180) / 5) + 1
+    # row = floor((60 - lat) / 5) + 1
+    minx, miny, maxx, maxy = country_bounds
+    if maxy > 60 or miny < -56:
+        print("Warning: SRTM coverage is limited (~60N to ~56S). Results may be incomplete.")
+    col_min = int((minx + 180) // 5) + 1
+    col_max = int((maxx + 180) // 5) + 1
+    row_min = int((60 - maxy) // 5) + 1
+    row_max = int((60 - miny) // 5) + 1
 
     tile_coords = [
-        (38, 2), (39, 2), (40, 2),  # Northern part
-        (38, 3), (39, 3), (40, 3),  # Central part
-        (38, 4), (39, 4), (40, 4),  # Southern part (Alps)
+        (col, row)
+        for col in range(col_min, col_max + 1)
+        for row in range(row_min, row_max + 1)
     ]
 
     tif_files = []
@@ -173,20 +209,20 @@ def download_srtm_via_elevation_api():
     return merged_file
 
 
-def clip_dem_to_germany(dem_path, germany_gdf):
-    """Clip DEM to Germany boundary."""
-    clipped_file = os.path.join(DATA_DIR, "germany_dem_clipped.tif")
+def clip_dem_to_country(dem_path, country_gdf, country_slug):
+    """Clip DEM to country boundary."""
+    clipped_file = os.path.join(DATA_DIR, f"{country_slug}_dem_clipped.tif")
     if os.path.exists(clipped_file):
         print("Clipped DEM already exists.")
         return clipped_file
 
-    print("Clipping DEM to Germany boundary...")
-    germany_4326 = germany_gdf.to_crs("EPSG:4326")
+    print("Clipping DEM to country boundary...")
+    country_4326 = country_gdf.to_crs("EPSG:4326")
 
     with rasterio.open(dem_path) as src:
         out_image, out_transform = rasterio_mask(
             src,
-            germany_4326.geometry,
+            country_4326.geometry,
             crop=True,
             nodata=-9999,
             filled=True
@@ -209,17 +245,25 @@ def clip_dem_to_germany(dem_path, germany_gdf):
 
 
 if __name__ == "__main__":
-    print("=== Downloading Data for Sea Level Rise Visualization ===\n")
+    parser = argparse.ArgumentParser(description="Download SRTM and clip to a country boundary.")
+    parser.add_argument("--country", default="Germany", help="Country name from Natural Earth (e.g. France).")
+    args = parser.parse_args()
 
-    # Step 1: Germany boundary
-    germany = download_germany_boundary()
-    print(f"Germany bounds: {germany.total_bounds}\n")
+    country_name = args.country
+    country_slug = slugify(country_name)
+
+    print("=== Downloading Data for Sea Level Rise Visualization ===\n")
+    print(f"Country: {country_name}\n")
+
+    # Step 1: Country boundary
+    country = download_country_boundary(country_name, country_slug)
+    print(f"{country_name} bounds: {country.total_bounds}\n")
 
     # Step 2: SRTM elevation data
-    dem_path = download_srtm_via_elevation_api()
+    dem_path = download_srtm_via_elevation_api(country.total_bounds, country_slug)
 
-    # Step 3: Clip to Germany
-    clipped_path = clip_dem_to_germany(dem_path, germany)
+    # Step 3: Clip to country
+    clipped_path = clip_dem_to_country(dem_path, country, country_slug)
 
     print("\n=== Data download complete! ===")
     print(f"Clipped DEM: {clipped_path}")
