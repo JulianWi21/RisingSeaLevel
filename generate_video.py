@@ -36,14 +36,15 @@ RESIZED_MAX_SCALE = 2.0  # default: pick resized DEM up to 2x video size
 UI_SCALE = min(WIDTH / 1920, HEIGHT / 1080)
 
 # Sea level settings
-SEA_LEVEL_MIN = 70
-SEA_LEVEL_MAX = 200
+SEA_LEVEL_MIN = 0
+SEA_LEVEL_MAX = 2000
 SEA_LEVEL_STEP = 0.25  # meters per frame
+MONT_BLANC_ELEVATION_M = 4809
 
 # Color scheme
 OCEAN_COLOR_DEEP = [40, 80, 160]
 OCEAN_COLOR_SHORE = [100, 160, 220]
-RIVER_COLOR = [60, 120, 200]
+RIVER_COLOR = [40, 80, 160]
 LAKE_SHORE_PX = 20          # rim width in pixels (at SRTM 90m ref resolution)
 
 # Terrain colormap
@@ -69,9 +70,9 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 LAND_BRIGHTNESS = 2.00  # 1.0 = unchanged
 LAND_SATURATION = 1.20  # 1.0 = unchanged
 LAND_BRIGHTNESS_ETOPO = 1.45
-LAND_SATURATION_ETOPO = 0.95
-HILLSHADE_STRENGTH_ETOPO = 0.80
-HILLSHADE_GAIN_ETOPO = 0.88
+LAND_SATURATION_ETOPO = 1.10
+HILLSHADE_STRENGTH_ETOPO = 0.65
+HILLSHADE_GAIN_ETOPO = 0.92
 HILLSHADE_STRENGTH_RESIZED = 0.85  # reduce hillshade contrast for resized DEMs
 HILLSHADE_BLUR_ITERS_RESIZED = 2  # softening for resized DEMs (0 = off)
 HILLSHADE_GAIN_RESIZED = 0.87     # overall darkening for resized hillshade
@@ -289,7 +290,7 @@ def load_fonts():
     return f, f, f
 
 
-def draw_text_on_frame(frame_img, sea_level, fonts):
+def draw_text_on_frame(frame_img, sea_level, fonts, sea_min, sea_max, ui_tick_step=None):
     """Draw text overlay directly on an RGB PIL Image (no RGBA overhead)."""
     font_large, font_small, small_font = fonts
     draw = ImageDraw.Draw(frame_img)
@@ -309,22 +310,64 @@ def draw_text_on_frame(frame_img, sea_level, fonts):
     bar_h = max(2, int(8 * s))
     bar_margin = int(50 * s)
     bar_width = WIDTH - 2 * bar_margin
-    progress = sea_level / SEA_LEVEL_MAX
+    denom = max(1e-6, sea_max - sea_min)
+    progress = np.clip((sea_level - sea_min) / denom, 0.0, 1.0)
 
     draw.rectangle([bar_margin, bar_y, bar_margin + bar_width, bar_y + bar_h], fill=(40, 40, 40))
     fill_width = int(bar_width * progress)
     if fill_width > 0:
         draw.rectangle([bar_margin, bar_y, bar_margin + fill_width, bar_y + bar_h], fill=(100, 180, 255))
 
-    tick_step = 50
-    for lv in range(0, SEA_LEVEL_MAX + 1, tick_step):
-        lx = bar_margin + int(bar_width * (lv / SEA_LEVEL_MAX))
+    tick_step = ui_tick_step if ui_tick_step is not None else pick_tick_step(sea_max - sea_min)
+    if tick_step <= 0:
+        tick_step = pick_tick_step(sea_max - sea_min)
+    start_tick = int(np.ceil(sea_min / tick_step) * tick_step)
+    end_tick = int(np.floor(sea_max / tick_step) * tick_step)
+    if end_tick < start_tick:
+        start_tick = int(sea_min)
+        end_tick = int(sea_max)
+    for lv in range(start_tick, end_tick + 1, tick_step):
+        lx = bar_margin + int(bar_width * ((lv - sea_min) / denom))
         tick = max(1, int(4 * s))
         draw.line([(lx, bar_y - tick), (lx, bar_y + bar_h + tick)], fill=(150, 150, 150), width=max(1, int(1 * s)))
         lt = f"{lv}m"
         bbox = draw.textbbox((0, 0), lt, font=small_font)
         tw = bbox[2] - bbox[0]
         draw.text((lx - tw // 2, bar_y + bar_h + int(6 * s)), lt, font=small_font, fill=(180, 180, 180))
+
+
+def pick_tick_step(sea_range):
+    """Pick a readable axis tick step based on the sea-level range."""
+    if sea_range <= 20:
+        return 5
+    if sea_range <= 60:
+        return 10
+    if sea_range <= 150:
+        return 25
+    if sea_range <= 400:
+        return 50
+    if sea_range <= 1200:
+        return 100
+    if sea_range <= 3000:
+        return 250
+    return 500
+
+
+def build_sea_levels(sea_min, sea_max, sea_step, curve):
+    """Build monotonically increasing sea levels using the requested curve."""
+    if sea_max <= sea_min:
+        return np.array([float(sea_min)], dtype=np.float32)
+    frame_count = max(2, int(round((sea_max - sea_min) / sea_step)) + 1)
+    t = np.linspace(0.0, 1.0, frame_count, dtype=np.float32)
+    if curve == "quadratic":
+        shaped = t ** 2
+    elif curve == "log":
+        # Fast early rise, then flatten (classic logarithmic progression).
+        k = 9.0
+        shaped = np.log1p(k * t) / np.log1p(k)
+    else:
+        shaped = t
+    return sea_min + (sea_max - sea_min) * shaped
 
 
 def precompute_scaled_dims(dem_shape):
@@ -343,10 +386,9 @@ def render_frame_gpu(dem_gpu, is_nodata_gpu, sea_level, terrain_lut_gpu,
                      rivers_mask_gpu, lakes_mask_gpu, lake_rim_weight_gpu,
                      hillshade_gpu, ocean_noise_gpu, shore_t, deep_t, river_t, deep_bg_t):
     """Render a single frame entirely on GPU. Returns HxWx3 float tensor on GPU."""
-    # Masks
+    # Masks — areas below 0m are protected by dams until sea_level > FLOOD_PROTECTION_M
     is_land = (~is_nodata_gpu) & (dem_gpu >= sea_level)
     is_flooded = (~is_nodata_gpu) & (dem_gpu < sea_level)
-
     # Output image
     img = torch.zeros_like(hillshade_gpu).unsqueeze(2).expand(-1, -1, 3).contiguous()
     img = img * 0  # zero it out, keep shape
@@ -411,11 +453,13 @@ def render_frame_gpu(dem_gpu, is_nodata_gpu, sea_level, terrain_lut_gpu,
     # Background ocean
     img[is_nodata_gpu] = deep_bg_t
 
-    # Hillshade on land only (exclude lakes — no shadow on water)
+    # Hillshade on land only (exclude lakes and rivers — no shadow on water)
     hs = hillshade_gpu.unsqueeze(2)
     land_for_hs = is_land
     if is_lake is not None:
-        land_for_hs = is_land & ~is_lake
+        land_for_hs = land_for_hs & ~is_lake
+    if rivers_mask_gpu is not None:
+        land_for_hs = land_for_hs & ~rivers_mask_gpu
     img = torch.where(land_for_hs.unsqueeze(2), img * hs, img)
 
     # Ocean noise
@@ -440,6 +484,18 @@ def parse_args():
     parser.add_argument("--preview", default=None, help="Write a single PNG preview and exit.")
     parser.add_argument("--preview-level", type=float, default=None,
                         help="Sea level for preview in meters (default: SEA_LEVEL_MIN).")
+    parser.add_argument("--sea-min", type=float, default=SEA_LEVEL_MIN,
+                        help=f"Minimum sea level in meters (default: {SEA_LEVEL_MIN}).")
+    parser.add_argument("--sea-max", type=float, default=None,
+                        help=f"Maximum sea level in meters (default: {SEA_LEVEL_MAX}).")
+    parser.add_argument("--sea-max-montblanc", action="store_true",
+                        help=f"Use Mont Blanc elevation as max sea level ({MONT_BLANC_ELEVATION_M}m).")
+    parser.add_argument("--sea-step", type=float, default=SEA_LEVEL_STEP,
+                        help=f"Step in meters used to determine frame count (default: {SEA_LEVEL_STEP}).")
+    parser.add_argument("--sea-curve", choices=["linear", "quadratic", "log"], default="linear",
+                        help="Sea-level growth curve over time.")
+    parser.add_argument("--ui-tick-step", type=int, default=None,
+                        help="Fixed tick step (meters) for the bottom scale. Default: auto.")
     return parser.parse_args()
 
 
@@ -584,10 +640,28 @@ def main():
     ocean_noise_gpu = torch.from_numpy(noise_np).to(DEVICE, dtype=torch.float32)
 
     # Sea levels
-    sea_levels = np.arange(SEA_LEVEL_MIN, SEA_LEVEL_MAX + SEA_LEVEL_STEP, SEA_LEVEL_STEP)
+    sea_min = float(args.sea_min)
+    if args.sea_max_montblanc:
+        sea_max = float(MONT_BLANC_ELEVATION_M)
+    elif args.sea_max is not None:
+        sea_max = float(args.sea_max)
+    else:
+        sea_max = float(SEA_LEVEL_MAX)
+    sea_step = float(args.sea_step)
+    if sea_step <= 0:
+        print("ERROR: --sea-step must be > 0.")
+        sys.exit(1)
+    if sea_max < sea_min:
+        print("ERROR: --sea-max must be >= --sea-min.")
+        sys.exit(1)
+    sea_levels = build_sea_levels(sea_min, sea_max, sea_step, args.sea_curve)
     total_frames = len(sea_levels)
     duration_sec = total_frames / FPS
-    print(f"\nTotal frames: {total_frames} (every {SEA_LEVEL_STEP}m)")
+    print(
+        f"\nSea levels: {sea_min:.1f}m -> {sea_max:.1f}m "
+        f"({args.sea_curve}, base step {sea_step}m)"
+    )
+    print(f"Total frames: {total_frames}")
     print(f"Video duration: {duration_sec:.1f}s at {FPS}fps")
 
     # Load fonts
@@ -637,7 +711,7 @@ def main():
         return img_resized.to(torch.uint8).cpu().numpy()
 
     if preview_path:
-        sl = float(SEA_LEVEL_MIN if preview_level is None else preview_level)
+        sl = float(sea_min if preview_level is None else preview_level)
 
         img_gpu = render_frame_gpu(
             dem_gpu, is_nodata_gpu, sl, terrain_lut_gpu,
@@ -651,7 +725,7 @@ def main():
         frame_array[off_y:off_y + new_h, off_x:off_x + new_w] = img_small
 
         frame_img = Image.fromarray(frame_array)
-        draw_text_on_frame(frame_img, sl, fonts)
+        draw_text_on_frame(frame_img, sl, fonts, sea_min, sea_max)
         frame_img.save(preview_path)
         print(f"Preview saved to: {preview_path}")
         return
@@ -698,7 +772,7 @@ def main():
 
         # Draw text overlay directly
         frame_img = Image.fromarray(frame_array)
-        draw_text_on_frame(frame_img, sl, fonts)
+        draw_text_on_frame(frame_img, sl, fonts, sea_min, sea_max)
 
         # Write raw RGB bytes to ffmpeg
         ffmpeg_proc.stdin.write(frame_img.tobytes())
