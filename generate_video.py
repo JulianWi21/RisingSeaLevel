@@ -30,19 +30,22 @@ DEFAULT_COUNTRY = "Germany"
 WIDTH = 3840
 HEIGHT = 2160
 FPS = 60
+RESIZED_MAX_SCALE = 2.0  # default: pick resized DEM up to 2x video size
 
 # UI scale relative to 1080p baseline
 UI_SCALE = min(WIDTH / 1920, HEIGHT / 1080)
 
 # Sea level settings
-SEA_LEVEL_MIN = 0
-SEA_LEVEL_MAX = 1000
-SEA_LEVEL_STEP = 0.5  # meters per frame
+SEA_LEVEL_MIN = 70
+SEA_LEVEL_MAX = 200
+SEA_LEVEL_STEP = 0.25  # meters per frame
 
 # Color scheme
 OCEAN_COLOR_DEEP = [40, 80, 160]
 OCEAN_COLOR_SHORE = [100, 160, 220]
 RIVER_COLOR = [60, 120, 200]
+LAKE_SHORE_PX = 3           # 0 = off, rim width in pixels
+LAKE_SHORE_STRENGTH = 0.35  # 0..1 blend toward shore color at lake rim
 
 # Terrain colormap
 TERRAIN_COLORS = [
@@ -66,7 +69,13 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # Land appearance tuning
 LAND_BRIGHTNESS = 2.00  # 1.0 = unchanged
 LAND_SATURATION = 1.20  # 1.0 = unchanged
-
+LAND_BRIGHTNESS_ETOPO = 1.45
+LAND_SATURATION_ETOPO = 0.95
+HILLSHADE_STRENGTH_ETOPO = 0.80
+HILLSHADE_GAIN_ETOPO = 0.88
+HILLSHADE_STRENGTH_RESIZED = 0.85  # reduce hillshade contrast for resized DEMs
+HILLSHADE_BLUR_ITERS_RESIZED = 2  # softening for resized DEMs (0 = off)
+HILLSHADE_GAIN_RESIZED = 0.87     # overall darkening for resized hillshade
 # Supersampling factor for resize (1.0 = off, higher = smoother, slower)
 SUPERSAMPLE = 1.0
 
@@ -101,7 +110,7 @@ def load_dem_data(dem_path):
     """Load the clipped DEM."""
     if not os.path.exists(dem_path):
         print(f"ERROR: DEM data not found: {dem_path}")
-        print("Run download_data.py --country \"<Name>\" first, or pass --dem.")
+        print("Run download_data.py <Name> (or --country \"<Name>\") first, or pass --dem.")
         sys.exit(1)
     with rasterio.open(dem_path) as src:
         dem = src.read(1).astype(np.float32)
@@ -123,16 +132,27 @@ def download_if_missing(filename, url):
 
 
 def load_water_bodies(dem_path, water_tag, data_dir):
-    """Load ALL water bodies."""
-    water_raster_path = os.path.join(data_dir, f"water_bodies_{water_tag}.npy")
-    if os.path.exists(water_raster_path):
-        print("Water body raster already exists, loading...")
-        return np.load(water_raster_path)
-
+    """Load ALL water bodies (separate rivers and lakes)."""
+    water_rivers_path = os.path.join(data_dir, f"water_rivers_{water_tag}.npy")
+    water_lakes_path = os.path.join(data_dir, f"water_lakes_{water_tag}.npy")
     with rasterio.open(dem_path) as src:
         dem_transform = src.transform
         dem_shape = (src.height, src.width)
         dem_bounds = src.bounds
+    if os.path.exists(water_rivers_path) and os.path.exists(water_lakes_path):
+        print("Water body rasters already exist, loading...")
+        rivers_existing = np.load(water_rivers_path)
+        lakes_existing = np.load(water_lakes_path)
+        if rivers_existing.shape == dem_shape and lakes_existing.shape == dem_shape:
+            return rivers_existing, lakes_existing
+        print(
+            f"Water body raster shape mismatch (rivers {rivers_existing.shape}, lakes {lakes_existing.shape} vs {dem_shape}), rebuilding..."
+        )
+        for path in (water_rivers_path, water_lakes_path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
     clip_box = box(dem_bounds.left, dem_bounds.bottom, dem_bounds.right, dem_bounds.top)
 
@@ -147,8 +167,14 @@ def load_water_bodies(dem_path, water_tag, data_dir):
                           "https://naciscdn.org/naturalearth/10m/physical/ne_10m_lakes_europe.zip", "polygon"),
     }
 
-    print("Loading all water body datasets...")
-    water_raster = np.zeros(dem_shape, dtype=np.uint8)
+    # Scale dilation iterations by DEM resolution (reference: SRTM ~90m/pixel)
+    pixel_deg = abs(dem_transform.a)
+    pixel_m = pixel_deg * 111000
+    ref_pixel_m = 90.0
+    dilation_scale = ref_pixel_m / pixel_m
+    print(f"Loading all water body datasets (pixel ~{pixel_m:.0f}m, dilation scale {dilation_scale:.2f})...")
+    rivers_raster = np.zeros(dem_shape, dtype=np.uint8)
+    lakes_raster = np.zeros(dem_shape, dtype=np.uint8)
 
     for name, (filename, url, geom_type) in datasets.items():
         filepath = download_if_missing(filename, url)
@@ -169,24 +195,28 @@ def load_water_bodies(dem_path, water_tag, data_dir):
                     shapes = [(g, 1) for g in subset.geometry if g is not None]
                     layer = rasterize(shapes, out_shape=dem_shape, transform=dem_transform,
                                       fill=0, dtype=np.uint8, all_touched=True)
-                    if width > 1:
-                        layer = scipy_binary_dilation(layer, iterations=width - 1).astype(np.uint8)
-                    water_raster = np.maximum(water_raster, layer)
+                    scaled_iters = max(0, round((width - 1) * dilation_scale))
+                    if scaled_iters > 0:
+                        layer = scipy_binary_dilation(layer, iterations=scaled_iters).astype(np.uint8)
+                    rivers_raster = np.maximum(rivers_raster, layer)
             else:
                 shapes = [(g, 1) for g in clipped.geometry if g is not None]
                 layer = rasterize(shapes, out_shape=dem_shape, transform=dem_transform,
                                   fill=0, dtype=np.uint8, all_touched=True)
-                water_raster = np.maximum(water_raster, layer)
+                lakes_raster = np.maximum(lakes_raster, layer)
         except Exception as e:
             print(f"  {name}: ERROR - {e}")
 
-    np.save(water_raster_path, water_raster)
-    print(f"  Water body raster saved ({np.sum(water_raster > 0)} water pixels)")
-    return water_raster
+    np.save(water_rivers_path, rivers_raster)
+    np.save(water_lakes_path, lakes_raster)
+    print(
+        f"  Water rasters saved (rivers {np.sum(rivers_raster > 0)} px, lakes {np.sum(lakes_raster > 0)} px)"
+    )
+    return rivers_raster, lakes_raster
 
 
-def compute_hillshade_gpu(dem_np):
-    """Pre-compute hillshade on GPU."""
+def compute_hillshade_gpu(dem_np, pixel_size_m=90.0):
+    """Pre-compute hillshade on GPU. Slope exaggeration scales with pixel size."""
     dem_filled = np.where(np.isnan(dem_np), 0, dem_np)
     d = torch.from_numpy(dem_filled).to(DEVICE, dtype=torch.float32)
 
@@ -198,13 +228,43 @@ def compute_hillshade_gpu(dem_np):
     azimuth = 315.0 * 3.14159265 / 180.0
     altitude = 45.0 * 3.14159265 / 180.0
 
-    slope = torch.atan(torch.sqrt(dx**2 + dy**2) * 3.0)
+    exag = 3.0 * (90.0 / pixel_size_m)
+    slope = torch.atan(torch.sqrt(dx**2 + dy**2) * exag)
     aspect = torch.atan2(-dy, dx)
 
     hillshade = (torch.sin(torch.tensor(altitude, device=DEVICE)) * torch.cos(slope) +
                  torch.cos(torch.tensor(altitude, device=DEVICE)) * torch.sin(slope) *
                  torch.cos(torch.tensor(azimuth, device=DEVICE) - aspect))
     return torch.clamp(hillshade, 0.3, 1.0)
+
+
+def blur_hillshade_gpu(hillshade_gpu, iterations=1):
+    """Lightly blur hillshade to reduce sharpness on resized DEMs."""
+    if iterations <= 0:
+        return hillshade_gpu
+    hs = hillshade_gpu.unsqueeze(0).unsqueeze(0)
+    for _ in range(iterations):
+        hs = F.avg_pool2d(hs, kernel_size=3, stride=1, padding=1)
+    return hs.squeeze(0).squeeze(0)
+
+
+def build_lake_rim_weight(lakes_mask_gpu, rim_px):
+    """Create a 0..1 weight map (1 at lake edge, 0 inside) for a subtle rim."""
+    if rim_px <= 0:
+        return None
+    weights = torch.zeros_like(lakes_mask_gpu, dtype=torch.float32)
+    eroded = lakes_mask_gpu
+    for d in range(rim_px):
+        inv = (~eroded).float().unsqueeze(0).unsqueeze(0)
+        eroded_next = (F.max_pool2d(inv, kernel_size=3, stride=1, padding=1) == 0).squeeze()
+        ring = eroded & ~eroded_next
+        w = (rim_px - d) / rim_px
+        if torch.any(ring):
+            weights[ring] = w
+        eroded = eroded_next
+        if not torch.any(eroded):
+            break
+    return weights
 
 
 def load_fonts():
@@ -254,7 +314,7 @@ def draw_text_on_frame(frame_img, sea_level, fonts):
     if fill_width > 0:
         draw.rectangle([bar_margin, bar_y, bar_margin + fill_width, bar_y + bar_h], fill=(100, 180, 255))
 
-    tick_step = 250
+    tick_step = 50
     for lv in range(0, SEA_LEVEL_MAX + 1, tick_step):
         lx = bar_margin + int(bar_width * (lv / SEA_LEVEL_MAX))
         tick = max(1, int(4 * s))
@@ -268,7 +328,7 @@ def draw_text_on_frame(frame_img, sea_level, fonts):
 def precompute_scaled_dims(dem_shape):
     """Pre-compute the resize dimensions and offsets for fit_to_frame on GPU."""
     h, w = dem_shape
-    scale = min(WIDTH / w, HEIGHT / h) * 0.88
+    scale = min(WIDTH / w, HEIGHT / h)
     new_w = int(w * scale)
     new_h = int(h * scale)
     offset_x = (WIDTH - new_w) // 2
@@ -278,8 +338,8 @@ def precompute_scaled_dims(dem_shape):
 
 @torch.no_grad()
 def render_frame_gpu(dem_gpu, is_nodata_gpu, sea_level, terrain_lut_gpu,
-                     water_mask_gpu, hillshade_gpu, ocean_noise_gpu,
-                     shore_t, deep_t, river_t, deep_bg_t):
+                     rivers_mask_gpu, lakes_mask_gpu, lake_rim_weight_gpu,
+                     hillshade_gpu, ocean_noise_gpu, shore_t, deep_t, river_t, deep_bg_t):
     """Render a single frame entirely on GPU. Returns HxWx3 float tensor on GPU."""
     # Masks
     is_land = (~is_nodata_gpu) & (dem_gpu >= sea_level)
@@ -304,46 +364,71 @@ def render_frame_gpu(dem_gpu, is_nodata_gpu, sea_level, terrain_lut_gpu,
             land_rgb = land_rgb * LAND_BRIGHTNESS
         img[is_land] = land_rgb
 
-    # Flooded areas
+    # Lake masks
+    is_lake = None
+    is_lake_unflooded = None
+    if lakes_mask_gpu is not None:
+        is_lake = lakes_mask_gpu & ~is_nodata_gpu
+        is_lake_unflooded = is_lake & ~is_flooded
+
+    # Flooded areas — lake pixels get a fake extra depth so they stay deep
+    LAKE_FAKE_DEPTH = 30.0
     if torch.any(is_flooded):
         max_vis_depth = max(50.0, sea_level * 0.5)
         water_depth = sea_level - dem_gpu[is_flooded]
+        if is_lake is not None:
+            is_lake_flooded = is_lake & is_flooded
+            lake_flooded_in_flood = is_lake_flooded[is_flooded]
+            water_depth[lake_flooded_in_flood] = water_depth[lake_flooded_in_flood] + LAKE_FAKE_DEPTH
         depth_norm = torch.clamp(water_depth / max_vis_depth, 0.0, 1.0).unsqueeze(1)
         img[is_flooded] = shore_t * (1 - depth_norm) + deep_t * depth_norm
 
-    # Water bodies on land
-    is_water_on_land = water_mask_gpu & is_land
-    if torch.any(is_water_on_land):
-        img[is_water_on_land] = river_t
+    # Rivers on land only (disappear when flooded)
+    if rivers_mask_gpu is not None:
+        is_river_on_land = rivers_mask_gpu & is_land
+        if lakes_mask_gpu is not None:
+            is_river_on_land = is_river_on_land & ~lakes_mask_gpu
+        if torch.any(is_river_on_land):
+            img[is_river_on_land] = river_t
+
+    # Unflooded lakes: deep color with shore rim
+    if is_lake_unflooded is not None and torch.any(is_lake_unflooded):
+        img[is_lake_unflooded] = deep_t
+        if lake_rim_weight_gpu is not None and LAKE_SHORE_STRENGTH > 0.0:
+            rim_w = lake_rim_weight_gpu[is_lake_unflooded].unsqueeze(1)
+            if rim_w.numel() > 0:
+                rim_w = rim_w * LAKE_SHORE_STRENGTH
+                img[is_lake_unflooded] = img[is_lake_unflooded] * (1.0 - rim_w) + shore_t * rim_w
 
     # Background ocean
     img[is_nodata_gpu] = deep_bg_t
 
-    # Hillshade on land
+    # Hillshade on land only (exclude lakes — no shadow on water)
     hs = hillshade_gpu.unsqueeze(2)
-    land_3d = is_land.unsqueeze(2)
-    img = torch.where(land_3d, img * hs, img)
+    land_for_hs = is_land
+    if is_lake_unflooded is not None:
+        land_for_hs = is_land & ~is_lake_unflooded
+    img = torch.where(land_for_hs.unsqueeze(2), img * hs, img)
 
     # Ocean noise
-    ocean_3d = (is_nodata_gpu | is_flooded).unsqueeze(2)
+    ocean_mask = is_nodata_gpu | is_flooded
+    ocean_3d = ocean_mask.unsqueeze(2)
     noise_3d = ocean_noise_gpu.unsqueeze(2)
     img = torch.where(ocean_3d, img * noise_3d, img)
 
-    # Coastline glow via max_pool
-    water_float = (is_flooded | is_nodata_gpu).float().unsqueeze(0).unsqueeze(0)
-    dilated = F.max_pool2d(water_float, kernel_size=5, stride=1, padding=2).squeeze() > 0
-    coastline = dilated & is_land
-    if torch.any(coastline):
-        img[coastline] = img[coastline] * 0.7 + 255.0 * 0.3
 
     return torch.clamp(img, 0, 255)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Sea level rise visualization renderer.")
-    parser.add_argument("--country", default=DEFAULT_COUNTRY,
+    parser.add_argument("country", nargs="?",
                         help="Country name (must match Natural Earth, e.g. Germany).")
+    parser.add_argument("--country", dest="country_opt", default=None,
+                        help="Country name (overrides positional).")
     parser.add_argument("--dem", default=None, help="Path to clipped DEM .tif (overrides --country).")
+    parser.add_argument("--full-res", action="store_true",
+                        help="Use the full-resolution DEM instead of a resized one.")
     parser.add_argument("--output", default=None, help="Output video path (.mp4).")
     parser.add_argument("--preview", default=None, help="Write a single PNG preview and exit.")
     parser.add_argument("--preview-level", type=float, default=None,
@@ -351,17 +436,67 @@ def parse_args():
     return parser.parse_args()
 
 
+def find_resized_dem(country_dir, country_slug, target_w, target_h):
+    pattern = re.compile(rf"^{re.escape(country_slug)}_(\d+)x(\d+)_dem_clipped\.tif$")
+    candidates = []
+    for base_dir in [country_dir, DATA_DIR]:
+        if not os.path.isdir(base_dir):
+            continue
+        for name in os.listdir(base_dir):
+            m = pattern.match(name)
+            if not m:
+                continue
+            w, h = int(m.group(1)), int(m.group(2))
+            if (w, h) == (1920, 1080):
+                # Ignore legacy stretched 1080p outputs
+                continue
+            candidates.append((w, h, os.path.join(base_dir, name)))
+    if not candidates:
+        return None
+    within = [c for c in candidates if c[0] <= target_w and c[1] <= target_h]
+    if within:
+        within.sort(key=lambda c: (c[0] * c[1], c[0], c[1]), reverse=True)
+        return within[0][2]
+    candidates.sort(key=lambda c: (c[0] * c[1], c[0], c[1]))
+    return candidates[0][2]
+
+
 def main():
     args = parse_args()
-    country_name = args.country
+    if args.country_opt and args.country and args.country_opt != args.country:
+        print("Warning: both positional and --country provided; using --country.")
+    country_name = args.country_opt or args.country or DEFAULT_COUNTRY
     country_slug = slugify(country_name)
     country_dir = os.path.join(DATA_DIR, country_slug)
-    dem_path = args.dem or os.path.join(country_dir, f"{country_slug}_dem_clipped.tif")
+    default_dem = os.path.join(country_dir, f"{country_slug}_dem_clipped.tif")
+    dem_path = args.dem or default_dem
+    if not args.dem and not args.full_res:
+        max_w = int(WIDTH * RESIZED_MAX_SCALE)
+        max_h = int(HEIGHT * RESIZED_MAX_SCALE)
+        resized_dem = find_resized_dem(country_dir, country_slug, max_w, max_h)
+        if resized_dem:
+            print(f"Note: using resized DEM: {resized_dem}")
+            dem_path = resized_dem
+    if not args.dem and not os.path.exists(dem_path):
+        legacy_dem = os.path.join(DATA_DIR, f"{country_slug}_dem_clipped.tif")
+        if os.path.exists(legacy_dem):
+            print(f"Note: using legacy DEM path: {legacy_dem}")
+            dem_path = legacy_dem
     dem_tag = country_slug
-    if args.dem:
-        dem_base = os.path.splitext(os.path.basename(args.dem))[0]
+    if dem_path != default_dem:
+        dem_base = os.path.splitext(os.path.basename(dem_path))[0]
         dem_tag = slugify(dem_base.replace("_dem_clipped", ""))
-    output_video = args.output or os.path.join(SCRIPT_DIR, f"sea_level_rise_{dem_tag}.mp4")
+    is_resized_dem = re.search(r"_\d+x\d+_dem_clipped\.tif$", os.path.basename(dem_path)) is not None
+    is_etopo_dem = "etopo" in os.path.basename(dem_path).lower()
+    if is_etopo_dem:
+        # Gentler land boost for coarse ETOPO DEMs (avoid oversaturation)
+        globals()["LAND_BRIGHTNESS"] = LAND_BRIGHTNESS_ETOPO
+        globals()["LAND_SATURATION"] = LAND_SATURATION_ETOPO
+    if args.output:
+        output_video = args.output
+    else:
+        name_tag = dem_tag if args.dem else country_slug
+        output_video = os.path.join(SCRIPT_DIR, f"sea_level_rise_{name_tag}.mp4")
     preview_path = args.preview
     preview_level = args.preview_level
     data_dir = os.path.dirname(dem_path)
@@ -381,8 +516,18 @@ def main():
     print("Loading DEM data...")
     dem_np, bounds = load_dem_data(dem_path)
 
+    # Compute pixel size for resolution-aware hillshade
+    with rasterio.open(dem_path) as src:
+        pixel_m = abs(src.transform.a) * 111000
+    print(f"Pixel size: ~{pixel_m:.0f}m")
+
     print("Loading water bodies...")
-    water_np = load_water_bodies(dem_path, dem_tag, data_dir)
+    water_data = load_water_bodies(dem_path, dem_tag, data_dir)
+    if isinstance(water_data, tuple):
+        rivers_np, lakes_np = water_data
+    else:
+        rivers_np = water_data
+        lakes_np = None
 
     print("Creating terrain colormap...")
     terrain_lut_gpu = create_terrain_lut()
@@ -394,7 +539,14 @@ def main():
 
     dem_gpu = torch.from_numpy(dem_clean).to(DEVICE, dtype=torch.float32)
     is_nodata_gpu = torch.from_numpy(is_nodata_np).to(DEVICE, dtype=torch.bool)
-    water_mask_gpu = torch.from_numpy(water_np > 0).to(DEVICE, dtype=torch.bool)
+    rivers_mask_gpu = torch.from_numpy(rivers_np > 0).to(DEVICE, dtype=torch.bool)
+    lakes_mask_gpu = None
+    lake_rim_weight_gpu = None
+    if lakes_np is not None:
+        lakes_mask_gpu = torch.from_numpy(lakes_np > 0).to(DEVICE, dtype=torch.bool)
+        scaled_rim_px = max(0, round(LAKE_SHORE_PX * (90.0 / pixel_m)))
+        if scaled_rim_px > 0:
+            lake_rim_weight_gpu = build_lake_rim_weight(lakes_mask_gpu, scaled_rim_px)
 
     # Pre-allocate color tensors on GPU (avoid re-creating each frame)
     shore_t = torch.tensor(OCEAN_COLOR_SHORE, dtype=torch.float32, device=DEVICE)
@@ -403,7 +555,20 @@ def main():
     deep_bg_t = torch.tensor(OCEAN_COLOR_DEEP, dtype=torch.float32, device=DEVICE)
 
     print("Computing hillshade on GPU...")
-    hillshade_gpu = compute_hillshade_gpu(dem_np)
+    hillshade_gpu = compute_hillshade_gpu(dem_np, pixel_size_m=pixel_m)
+    if is_resized_dem:
+        if HILLSHADE_STRENGTH_RESIZED != 1.0:
+            hillshade_gpu = 1.0 - HILLSHADE_STRENGTH_RESIZED + HILLSHADE_STRENGTH_RESIZED * hillshade_gpu
+        if HILLSHADE_BLUR_ITERS_RESIZED > 0:
+            hillshade_gpu = blur_hillshade_gpu(hillshade_gpu, HILLSHADE_BLUR_ITERS_RESIZED)
+        if HILLSHADE_GAIN_RESIZED != 1.0:
+            hillshade_gpu = torch.clamp(hillshade_gpu * HILLSHADE_GAIN_RESIZED, 0.0, 1.0)
+
+    if is_etopo_dem:
+        if HILLSHADE_STRENGTH_ETOPO != 1.0:
+            hillshade_gpu = 1.0 - HILLSHADE_STRENGTH_ETOPO + HILLSHADE_STRENGTH_ETOPO * hillshade_gpu
+        if HILLSHADE_GAIN_ETOPO != 1.0:
+            hillshade_gpu = torch.clamp(hillshade_gpu * HILLSHADE_GAIN_ETOPO, 0.0, 1.0)
 
     print("Generating ocean noise...")
     from scipy.ndimage import gaussian_filter
@@ -430,6 +595,8 @@ def main():
 
     def resize_to_frame(img_gpu):
         img_chw = img_gpu.permute(2, 0, 1).unsqueeze(0)
+        src_h, src_w = img_chw.shape[2], img_chw.shape[3]
+        downsampling = new_h < src_h or new_w < src_w
         if SUPERSAMPLE > 1.0:
             ss_w = max(1, int(new_w * SUPERSAMPLE))
             ss_h = max(1, int(new_h * SUPERSAMPLE))
@@ -437,16 +604,29 @@ def main():
                 img_chw, size=(ss_h, ss_w),
                 mode='bicubic', align_corners=False
             )
-            img_resized = F.interpolate(
-                img_resized, size=(new_h, new_w),
-                mode='bicubic', align_corners=False, antialias=True
-            )
+            if downsampling:
+                img_resized = F.interpolate(
+                    img_resized, size=(new_h, new_w),
+                    mode='area'
+                )
+            else:
+                img_resized = F.interpolate(
+                    img_resized, size=(new_h, new_w),
+                    mode='bicubic', align_corners=False, antialias=True
+                )
         else:
-            img_resized = F.interpolate(
-                img_chw, size=(new_h, new_w),
-                mode='bicubic', align_corners=False, antialias=True
-            )
+            if downsampling:
+                img_resized = F.interpolate(
+                    img_chw, size=(new_h, new_w),
+                    mode='area'
+                )
+            else:
+                img_resized = F.interpolate(
+                    img_chw, size=(new_h, new_w),
+                    mode='bicubic', align_corners=False, antialias=True
+                )
         img_resized = img_resized.squeeze(0).permute(1, 2, 0)
+        img_resized = torch.clamp(img_resized, 0, 255)
         return img_resized.to(torch.uint8).cpu().numpy()
 
     if preview_path:
@@ -454,8 +634,8 @@ def main():
 
         img_gpu = render_frame_gpu(
             dem_gpu, is_nodata_gpu, sl, terrain_lut_gpu,
-            water_mask_gpu, hillshade_gpu, ocean_noise_gpu,
-            shore_t, deep_t, river_t, deep_bg_t
+            rivers_mask_gpu, lakes_mask_gpu, lake_rim_weight_gpu,
+            hillshade_gpu, ocean_noise_gpu, shore_t, deep_t, river_t, deep_bg_t
         )
 
         img_small = resize_to_frame(img_gpu)
@@ -498,8 +678,8 @@ def main():
         # Render on GPU
         img_gpu = render_frame_gpu(
             dem_gpu, is_nodata_gpu, sl, terrain_lut_gpu,
-            water_mask_gpu, hillshade_gpu, ocean_noise_gpu,
-            shore_t, deep_t, river_t, deep_bg_t
+            rivers_mask_gpu, lakes_mask_gpu, lake_rim_weight_gpu,
+            hillshade_gpu, ocean_noise_gpu, shore_t, deep_t, river_t, deep_bg_t
         )
 
         # Resize to frame
