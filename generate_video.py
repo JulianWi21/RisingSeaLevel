@@ -44,8 +44,7 @@ SEA_LEVEL_STEP = 0.25  # meters per frame
 OCEAN_COLOR_DEEP = [40, 80, 160]
 OCEAN_COLOR_SHORE = [100, 160, 220]
 RIVER_COLOR = [60, 120, 200]
-LAKE_SHORE_PX = 3           # 0 = off, rim width in pixels
-LAKE_SHORE_STRENGTH = 0.35  # 0..1 blend toward shore color at lake rim
+LAKE_SHORE_PX = 20          # rim width in pixels (at SRTM 90m ref resolution)
 
 # Terrain colormap
 TERRAIN_COLORS = [
@@ -249,7 +248,7 @@ def blur_hillshade_gpu(hillshade_gpu, iterations=1):
 
 
 def build_lake_rim_weight(lakes_mask_gpu, rim_px):
-    """Create a 0..1 weight map (1 at lake edge, 0 inside) for a subtle rim."""
+    """Create a 0..1 weight map (1 at lake edge, 0 inside) with smooth falloff."""
     if rim_px <= 0:
         return None
     weights = torch.zeros_like(lakes_mask_gpu, dtype=torch.float32)
@@ -258,13 +257,16 @@ def build_lake_rim_weight(lakes_mask_gpu, rim_px):
         inv = (~eroded).float().unsqueeze(0).unsqueeze(0)
         eroded_next = (F.max_pool2d(inv, kernel_size=3, stride=1, padding=1) == 0).squeeze()
         ring = eroded & ~eroded_next
-        w = (rim_px - d) / rim_px
+        # Quadratic falloff: stays brighter (shore-like) longer, then drops off
+        t = d / rim_px
+        w = (1.0 - t) ** 2
         if torch.any(ring):
             weights[ring] = w
         eroded = eroded_next
         if not torch.any(eroded):
             break
     return weights
+
 
 
 def load_fonts():
@@ -371,17 +373,15 @@ def render_frame_gpu(dem_gpu, is_nodata_gpu, sea_level, terrain_lut_gpu,
         is_lake = lakes_mask_gpu & ~is_nodata_gpu
         is_lake_unflooded = is_lake & ~is_flooded
 
-    # Flooded areas — lake pixels get a fake extra depth so they stay deep
-    LAKE_FAKE_DEPTH = 30.0
-    if torch.any(is_flooded):
+    # Flooded areas — exclude lake pixels (they keep their own rendering)
+    is_flooded_nolake = is_flooded
+    if is_lake is not None:
+        is_flooded_nolake = is_flooded & ~is_lake
+    if torch.any(is_flooded_nolake):
         max_vis_depth = max(50.0, sea_level * 0.5)
-        water_depth = sea_level - dem_gpu[is_flooded]
-        if is_lake is not None:
-            is_lake_flooded = is_lake & is_flooded
-            lake_flooded_in_flood = is_lake_flooded[is_flooded]
-            water_depth[lake_flooded_in_flood] = water_depth[lake_flooded_in_flood] + LAKE_FAKE_DEPTH
+        water_depth = sea_level - dem_gpu[is_flooded_nolake]
         depth_norm = torch.clamp(water_depth / max_vis_depth, 0.0, 1.0).unsqueeze(1)
-        img[is_flooded] = shore_t * (1 - depth_norm) + deep_t * depth_norm
+        img[is_flooded_nolake] = shore_t * (1 - depth_norm) + deep_t * depth_norm
 
     # Rivers on land only (disappear when flooded)
     if rivers_mask_gpu is not None:
@@ -391,14 +391,22 @@ def render_frame_gpu(dem_gpu, is_nodata_gpu, sea_level, terrain_lut_gpu,
         if torch.any(is_river_on_land):
             img[is_river_on_land] = river_t
 
-    # Unflooded lakes: deep color with shore rim
-    if is_lake_unflooded is not None and torch.any(is_lake_unflooded):
-        img[is_lake_unflooded] = deep_t
-        if lake_rim_weight_gpu is not None and LAKE_SHORE_STRENGTH > 0.0:
-            rim_w = lake_rim_weight_gpu[is_lake_unflooded].unsqueeze(1)
-            if rim_w.numel() > 0:
-                rim_w = rim_w * LAKE_SHORE_STRENGTH
-                img[is_lake_unflooded] = img[is_lake_unflooded] * (1.0 - rim_w) + shore_t * rim_w
+    # All lake pixels: shore-to-deep gradient
+    # When flooded, the rim fades out proportionally to how deep the sea is above the lake
+    if is_lake is not None and torch.any(is_lake):
+        if lake_rim_weight_gpu is not None:
+            rim_w = lake_rim_weight_gpu[is_lake].unsqueeze(1)
+            # Fade rim toward deep when sea covers the lake
+            is_lake_flooded = is_lake & is_flooded
+            if torch.any(is_lake_flooded):
+                lake_flood_depth = torch.zeros(is_lake.sum(), device=DEVICE)
+                lake_flooded_in_lake = is_lake_flooded[is_lake]
+                lake_flood_depth[lake_flooded_in_lake] = sea_level - dem_gpu[is_lake][lake_flooded_in_lake]
+                fade = torch.clamp(lake_flood_depth / 30.0, 0.0, 1.0).unsqueeze(1)
+                rim_w = rim_w * (1.0 - fade)
+            img[is_lake] = shore_t * rim_w + deep_t * (1.0 - rim_w)
+        else:
+            img[is_lake] = deep_t
 
     # Background ocean
     img[is_nodata_gpu] = deep_bg_t
@@ -406,8 +414,8 @@ def render_frame_gpu(dem_gpu, is_nodata_gpu, sea_level, terrain_lut_gpu,
     # Hillshade on land only (exclude lakes — no shadow on water)
     hs = hillshade_gpu.unsqueeze(2)
     land_for_hs = is_land
-    if is_lake_unflooded is not None:
-        land_for_hs = is_land & ~is_lake_unflooded
+    if is_lake is not None:
+        land_for_hs = is_land & ~is_lake
     img = torch.where(land_for_hs.unsqueeze(2), img * hs, img)
 
     # Ocean noise
@@ -415,7 +423,6 @@ def render_frame_gpu(dem_gpu, is_nodata_gpu, sea_level, terrain_lut_gpu,
     ocean_3d = ocean_mask.unsqueeze(2)
     noise_3d = ocean_noise_gpu.unsqueeze(2)
     img = torch.where(ocean_3d, img * noise_3d, img)
-
 
     return torch.clamp(img, 0, 255)
 
