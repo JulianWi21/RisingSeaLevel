@@ -115,10 +115,25 @@ def create_image_with_overlay(terrain, sea_level, width, height, title):
     draw = ImageDraw.Draw(img)
     
     # Try to load a font, fall back to default if not available
-    try:
-        font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 48)
-        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 32)
-    except (IOError, OSError):
+    font_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",  # Linux
+        "/System/Library/Fonts/Helvetica.ttc",  # macOS
+        "C:\\Windows\\Fonts\\Arial.ttf",  # Windows
+    ]
+    
+    font_large = None
+    font_small = None
+    
+    for font_path in font_paths:
+        try:
+            font_large = ImageFont.truetype(font_path, 48)
+            font_small = ImageFont.truetype(font_path, 32)
+            break
+        except (IOError, OSError):
+            continue
+    
+    # Use default font if no system font found
+    if font_large is None:
         font_large = ImageFont.load_default()
         font_small = ImageFont.load_default()
     
@@ -165,7 +180,8 @@ def main():
     img = create_image_with_overlay(terrain, args.sea_level, args.width, args.height, title)
     
     print(f"Saving to {args.output}...")
-    img.save(args.output, quality=95)
+    # PNG format - no quality parameter needed (lossless compression)
+    img.save(args.output)
     
     print(f"✓ Demo image created successfully!")
     print(f"  - File: {args.output}")
