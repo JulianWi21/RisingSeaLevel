@@ -4,8 +4,28 @@ frames/
 
 # Output video
 *.mp4
+*.mov
+*.mkv
 
 # Python
 __pycache__/
 *.pyc
 *.npy
+.venv/
+venv/
+env/
+
+# Blender outputs
+*.blend
+*.blend1
+
+# Local previews / renders
+preview*.png
+
+# Local tool/config folders
+.claude/
+
+# OS / temp artifacts
+nul
+Thumbs.db
+.DS_Store
