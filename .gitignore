@@ -21,6 +21,9 @@ env/
 
 # Local previews / renders
 preview*.png
+demo*.png
+test*.png
+sea_level*.png
 
 # Local tool/config folders
 .claude/

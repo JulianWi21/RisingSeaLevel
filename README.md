@@ -1,6 +1,7 @@
 # RisingSeaLevel
 
 Visualisierung von Meeresspiegelanstieg auf Basis von Hoehendaten (SRTM/ETOPO), mit:
+- `create_demo_image.py` fuer schnelle Demo-Bilder (ohne Downloads)
 - `download_data.py` fuer Laender-DEM + Wasserdaten
 - `download_etopo_world.py` fuer globale ETOPO-15s-Daten
 - `generate_video.py` fuer GPU-beschleunigte MP4-Renderings
@@ -14,7 +15,7 @@ Die grossen Daten werden nach dem Clone lokal per Skript heruntergeladen.
 Bereits in `.gitignore` ausgeschlossen:
 - `data/`, `frames/`
 - `*.mp4`, `*.mov`, `*.mkv`
-- `preview*.png`
+- `preview*.png`, `demo*.png`
 - `*.blend`, `*.blend1`
 - `*.npy`
 
@@ -33,7 +34,39 @@ git clone <DEIN_REPO_URL>
 cd RisingSeaLevel
 ```
 
-## 2. Python-Umgebung
+## 2. Schnell-Demo: Bild Erstellen (ohne Downloads)
+
+Fuer einen schnellen Test kannst du sofort ein Demo-Bild erstellen - ohne Daten herunterladen zu muessen:
+
+```powershell
+python -m pip install numpy pillow scipy
+python create_demo_image.py --sea-level 50 --output demo_sea_level_rise.png
+```
+
+Das Skript generiert ein synthetisches Gelaende und visualisiert den Meeresspiegelanstieg.
+
+Weitere Optionen:
+
+```powershell
+# Verschiedene Meeresspiegel
+python create_demo_image.py --sea-level 0 --output demo_0m.png
+python create_demo_image.py --sea-level 100 --output demo_100m.png
+python create_demo_image.py --sea-level 200 --output demo_200m.png
+
+# Aufloesung anpassen
+python create_demo_image.py --width 3840 --height 2160 --sea-level 50
+
+# Anderen Seed fuer anderes Gelaende
+python create_demo_image.py --seed 123 --sea-level 50
+```
+
+Hilfe anzeigen:
+
+```powershell
+python create_demo_image.py --help
+```
+
+## 3. Python-Umgebung
 
 ```powershell
 python -m venv .venv
@@ -44,7 +77,7 @@ pip install numpy pandas scipy pillow affine rasterio geopandas shapely torch
 
 Wenn `torch` mit CUDA genutzt werden soll, ggf. passendes Wheel von der PyTorch-Seite installieren.
 
-## 3. Laender-Daten Herunterladen (SRTM)
+## 4. Laender-Daten Herunterladen (SRTM)
 
 Beispiel Deutschland:
 
@@ -59,7 +92,7 @@ Was passiert:
 - optional resized DEM wird erzeugt
 - Wasser-Raster werden vorab erstellt
 
-## 4. Globale Weltdaten (ETOPO) Herunterladen
+## 5. Globale Weltdaten (ETOPO) Herunterladen
 
 Fuer Welt-Rendering in Blender:
 
@@ -72,7 +105,7 @@ Output (Standard):
 
 Hinweis: grosser Download/Storage-Bedarf (mehrere GB). Plane genug freien Speicher ein.
 
-## 5. Video Rendern (Python Pipeline)
+## 6. Video Rendern (Python Pipeline)
 
 Vorschau:
 
@@ -86,7 +119,7 @@ Finales Video:
 python generate_video.py --country "Germany" --sea-min 0 --sea-max 200 --sea-step 0.5 --output sea_level_rise_germany.mp4
 ```
 
-## 6. Welt-Szene In Blender Erzeugen (optional)
+## 7. Welt-Szene In Blender Erzeugen (optional)
 
 Mit Atmosphaere:
 
@@ -100,7 +133,7 @@ Ohne Atmosphaere:
 blender --background --factory-startup --python blender_setup_world.py -- --heightmap data/world/etopo2022_surface_15s_world.tif --out data/world/world_basic.blend --sea-level 0 --sea-end 60 --animate
 ```
 
-## 7. GitHub Copilot Ablauf (fuer deinen Bruder)
+## 8. GitHub Copilot Ablauf (fuer deinen Bruder)
 
 So kann er das Projekt nach dem Clone direkt mit Copilot nutzen:
 
@@ -115,7 +148,7 @@ Gute Copilot-Prompts:
 - `Passe die Wasserfarben auf dunkleres Blau an und halte den Rest unveraendert.`
 - `Erhoehe die Tick-Dichte im unteren Balken auf 25m Schritte und zeige mir den Diff.`
 
-## 8. Farben, Balken und Look einfach anpassen
+## 9. Farben, Balken und Look einfach anpassen
 
 Die wichtigsten Stellen sind in `generate_video.py`.
 
@@ -150,7 +183,7 @@ Beispiel (langsamer, besser lesbare Skala):
 python generate_video.py --country "Germany" --sea-min 0 --sea-max 150 --sea-step 0.25 --sea-curve linear --ui-tick-step 25 --output sea_level_rise_germany.mp4
 ```
 
-## 9. Downloader + Merge (ETOPO Welt)
+## 10. Downloader + Merge (ETOPO Welt)
 
 `download_etopo_world.py` macht:
 1. Tile-Liste von NOAA laden
@@ -179,7 +212,7 @@ Custom Ausgabeorte:
 python download_etopo_world.py --out-dir data/world --output data/world/etopo_world.tif --workers 8 --mem-limit 4096
 ```
 
-## 10. Sauber Auf GitHub Pushen (ohne grosse Dateien)
+## 11. Sauber Auf GitHub Pushen (ohne grosse Dateien)
 
 Vor Commit pruefen:
 
