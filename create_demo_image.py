@@ -180,7 +180,7 @@ def main():
     img = create_image_with_overlay(terrain, args.sea_level, args.width, args.height, title)
     
     print(f"Saving to {args.output}...")
-    # PNG format - no quality parameter needed (lossless compression)
+    # PNG format - uses lossless compression by default
     img.save(args.output)
     
     print(f"✓ Demo image created successfully!")
