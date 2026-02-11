@@ -5,6 +5,7 @@ Uses synthetic terrain data - no downloads required.
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+from scipy.ndimage import zoom
 import argparse
 
 
@@ -24,7 +25,6 @@ def generate_synthetic_terrain(width, height, seed=42):
         noise = np.random.randn(height // freq + 2, width // freq + 2)
         
         # Interpolate to full size
-        from scipy.ndimage import zoom
         noise_full = zoom(noise, freq, order=1)
         
         # Crop to exact size
@@ -118,7 +118,7 @@ def create_image_with_overlay(terrain, sea_level, width, height, title):
     try:
         font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 48)
         font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 32)
-    except:
+    except (IOError, OSError):
         font_large = ImageFont.load_default()
         font_small = ImageFont.load_default()
     
