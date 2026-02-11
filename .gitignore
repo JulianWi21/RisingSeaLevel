@@ -18,6 +18,8 @@ env/
 # Blender outputs
 *.blend
 *.blend1
+blender_setup_world.py
+blender_setup_world_atmo.py
 
 # Local previews / renders
 preview*.png
