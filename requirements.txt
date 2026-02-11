@@ -18,6 +18,3 @@ shapely>=2.0.0
 # Deep learning for GPU-accelerated rendering
 # For CUDA support, install from PyTorch website: https://pytorch.org/get-started/locally/
 torch>=2.0.0
-
-# Note: For Blender scripts (blender_setup_world*.py), Blender must be installed separately
-# Blender includes its own Python environment with 'bpy' module

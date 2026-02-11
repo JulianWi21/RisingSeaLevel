@@ -4,7 +4,6 @@ Visualisierung von Meeresspiegelanstieg auf Basis von Hoehendaten (SRTM/ETOPO), 
 - `download_data.py` fuer Laender-DEM + Wasserdaten
 - `download_etopo_world.py` fuer globale ETOPO-15s-Daten
 - `generate_video.py` fuer GPU-beschleunigte MP4-Renderings
-- `blender_setup_world.py` / `blender_setup_world_atmo.py` fuer Blender-Weltszenen
 
 ## Ziel Fuer GitHub
 
@@ -24,7 +23,6 @@ Bereits in `.gitignore` ausgeschlossen:
 - Python 3.10+ (empfohlen 3.11)
 - `ffmpeg` im `PATH`
 - Optional, aber empfohlen: NVIDIA GPU + CUDA fuer schnelle Renderings
-- Blender (fuer die `blender_setup_*` Skripte)
 
 ## 1. Projekt Klonen
 
@@ -86,21 +84,7 @@ Finales Video:
 python generate_video.py --country "Germany" --sea-min 0 --sea-max 200 --sea-step 0.5 --output sea_level_rise_germany.mp4
 ```
 
-## 6. Welt-Szene In Blender Erzeugen (optional)
-
-Mit Atmosphaere:
-
-```powershell
-blender --background --factory-startup --python blender_setup_world_atmo.py -- --heightmap data/world/etopo2022_surface_15s_world.tif --out data/world/world_atmo.blend --sea-level 0 --sea-end 60 --animate
-```
-
-Ohne Atmosphaere:
-
-```powershell
-blender --background --factory-startup --python blender_setup_world.py -- --heightmap data/world/etopo2022_surface_15s_world.tif --out data/world/world_basic.blend --sea-level 0 --sea-end 60 --animate
-```
-
-## 7. GitHub Copilot Ablauf (fuer deinen Bruder)
+## 6. GitHub Copilot Ablauf (fuer deinen Bruder)
 
 So kann er das Projekt nach dem Clone direkt mit Copilot nutzen:
 
@@ -115,7 +99,7 @@ Gute Copilot-Prompts:
 - `Passe die Wasserfarben auf dunkleres Blau an und halte den Rest unveraendert.`
 - `Erhoehe die Tick-Dichte im unteren Balken auf 25m Schritte und zeige mir den Diff.`
 
-## 8. Farben, Balken und Look einfach anpassen
+## 7. Farben, Balken und Look einfach anpassen
 
 Die wichtigsten Stellen sind in `generate_video.py`.
 
@@ -150,7 +134,7 @@ Beispiel (langsamer, besser lesbare Skala):
 python generate_video.py --country "Germany" --sea-min 0 --sea-max 150 --sea-step 0.25 --sea-curve linear --ui-tick-step 25 --output sea_level_rise_germany.mp4
 ```
 
-## 9. Downloader + Merge (ETOPO Welt)
+## 8. Downloader + Merge (ETOPO Welt)
 
 `download_etopo_world.py` macht:
 1. Tile-Liste von NOAA laden
@@ -179,7 +163,7 @@ Custom Ausgabeorte:
 python download_etopo_world.py --out-dir data/world --output data/world/etopo_world.tif --workers 8 --mem-limit 4096
 ```
 
-## 10. Sauber Auf GitHub Pushen (ohne grosse Dateien)
+## 9. Sauber Auf GitHub Pushen (ohne grosse Dateien)
 
 Vor Commit pruefen:
 
