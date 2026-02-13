@@ -404,7 +404,13 @@ def resolve_city_label_positions(cities, font_city):
     pad = int(3 * s)
     offset = int(8 * s)
 
-    placed_boxes = []  # (x1, y1, x2, y2) of already-placed labels
+    placed_boxes = []  # (x1, y1, x2, y2) of already-placed labels + dots
+
+    # Reserve space for ALL city dots first so labels avoid them
+    dot_r = max(2, int(4 * s)) + pad
+    for city in cities:
+        fx, fy = city["frame_x"], city["frame_y"]
+        placed_boxes.append((fx - dot_r, fy - dot_r, fx + dot_r, fy + dot_r))
 
     for city in cities:
         fx, fy = city["frame_x"], city["frame_y"]
