@@ -489,6 +489,236 @@ def draw_cities_on_frame(draw, cities, sea_level, font_city):
         draw.text((tx, ty), name, font=font_city, fill=white)
 
 
+# === Mountain Support ===
+
+FAMOUS_MOUNTAINS = {
+    "austria": [
+        {"name": "Großglockner",  "lat": 47.0742, "lon": 12.6942, "elev": 3798},
+        {"name": "Wildspitze",    "lat": 46.8850, "lon": 10.8672, "elev": 3768},
+        {"name": "Weißkugel",     "lat": 46.8447, "lon": 10.7114, "elev": 3739},
+        {"name": "Großvenediger", "lat": 47.1092, "lon": 12.3444, "elev": 3657},
+        {"name": "Similaun",      "lat": 46.7600, "lon": 10.8817, "elev": 3599},
+        {"name": "Zuckerhütl",    "lat": 46.9917, "lon": 11.1350, "elev": 3507},
+        {"name": "Schrankogel",   "lat": 47.0408, "lon": 11.0892, "elev": 3497},
+        {"name": "Olperer",       "lat": 47.0200, "lon": 11.6767, "elev": 3476},
+        {"name": "Dachstein",     "lat": 47.4753, "lon": 13.6069, "elev": 2995},
+        {"name": "Großer Priel",  "lat": 47.7175, "lon": 14.0628, "elev": 2515},
+    ],
+    "turkey": [
+        {"name": "Ağrı Dağı",    "lat": 39.7019, "lon": 44.2991, "elev": 5137},
+        {"name": "Süphan Dağı",  "lat": 38.9256, "lon": 42.8281, "elev": 4058},
+        {"name": "Kaçkar Dağı",  "lat": 40.8333, "lon": 41.1833, "elev": 3937},
+        {"name": "Erciyes Dağı", "lat": 38.5316, "lon": 35.4526, "elev": 3917},
+        {"name": "Demirkazık",   "lat": 37.8339, "lon": 35.1414, "elev": 3756},
+        {"name": "Uludağ",       "lat": 40.0833, "lon": 29.2167, "elev": 2543},
+        {"name": "Nemrut Dağı",  "lat": 37.9810, "lon": 38.7411, "elev": 2150},
+    ],
+    "spain": [
+        {"name": "Teide",         "lat": 28.2724, "lon": -16.6425, "elev": 3718},
+        {"name": "Mulhacén",      "lat": 37.0534, "lon": -3.3111,  "elev": 3479},
+        {"name": "Aneto",         "lat": 42.6313, "lon": 0.6573,   "elev": 3404},
+        {"name": "Veleta",        "lat": 37.0561, "lon": -3.3667,  "elev": 3396},
+        {"name": "Posets",        "lat": 42.6558, "lon": 0.4311,   "elev": 3375},
+        {"name": "Pico de Almanzor", "lat": 40.2492, "lon": -5.2953, "elev": 2592},
+    ],
+    "germany": [
+        {"name": "Zugspitze",     "lat": 47.4211, "lon": 10.9853, "elev": 2962},
+        {"name": "Watzmann",      "lat": 47.5550, "lon": 12.9211, "elev": 2713},
+        {"name": "Feldberg",      "lat": 47.8742, "lon": 8.0036,  "elev": 1493},
+        {"name": "Großer Arber",  "lat": 49.1125, "lon": 13.1361, "elev": 1456},
+        {"name": "Brocken",       "lat": 51.7986, "lon": 10.6153, "elev": 1141},
+    ],
+    "switzerland": [
+        {"name": "Dufourspitze",  "lat": 45.9369, "lon": 7.8667,  "elev": 4634},
+        {"name": "Dom",           "lat": 46.0908, "lon": 7.8583,  "elev": 4545},
+        {"name": "Matterhorn",    "lat": 45.9764, "lon": 7.6586,  "elev": 4478},
+        {"name": "Jungfrau",      "lat": 46.5367, "lon": 7.9614,  "elev": 4158},
+        {"name": "Eiger",         "lat": 46.5775, "lon": 8.0053,  "elev": 3967},
+    ],
+    "italy": [
+        {"name": "Monte Bianco",  "lat": 45.8326, "lon": 6.8652,  "elev": 4808},
+        {"name": "Monte Rosa",    "lat": 45.9369, "lon": 7.8667,  "elev": 4634},
+        {"name": "Gran Paradiso", "lat": 45.5181, "lon": 7.2661,  "elev": 4061},
+        {"name": "Etna",          "lat": 37.7510, "lon": 14.9934, "elev": 3357},
+        {"name": "Vesuvio",       "lat": 40.8213, "lon": 14.4260, "elev": 1281},
+    ],
+    "france": [
+        {"name": "Mont Blanc",    "lat": 45.8326, "lon": 6.8652,  "elev": 4808},
+        {"name": "Barre des Écrins", "lat": 44.9225, "lon": 6.3578, "elev": 4102},
+        {"name": "Mont Ventoux",  "lat": 44.1742, "lon": 5.2789,  "elev": 1912},
+        {"name": "Puy de Sancy",  "lat": 45.5311, "lon": 2.8142,  "elev": 1886},
+    ],
+}
+
+
+def load_mountains(country_name, dem_path, num_mountains=5):
+    """Load famous mountains for a country. Uses built-in database,
+    filtered to those within the DEM bounding box."""
+    key = country_name.strip().lower()
+    candidates = FAMOUS_MOUNTAINS.get(key, [])
+    if not candidates:
+        print(f"  Warning: No mountains defined for '{country_name}'.")
+        return []
+
+    result = []
+    with rasterio.open(dem_path) as src:
+        bounds = src.bounds  # left, bottom, right, top
+        dem_data = src.read(1)
+        for mt in candidates:
+            lon, lat = mt["lon"], mt["lat"]
+            # Check within DEM bounds (with small buffer)
+            buf = 0.01
+            if not (bounds.left - buf <= lon <= bounds.right + buf and
+                    bounds.bottom - buf <= lat <= bounds.top + buf):
+                continue
+            # Get DEM elevation at peak location
+            try:
+                py, px = src.index(lon, lat)
+                if 0 <= py < src.height and 0 <= px < src.width:
+                    elev = float(dem_data[py, px])
+                else:
+                    elev = mt["elev"]
+            except Exception:
+                elev = mt["elev"]
+            result.append({
+                "name": mt["name"],
+                "lon": lon, "lat": lat,
+                "elevation": max(elev, mt["elev"]),
+                "catalog_elev": mt["elev"],
+            })
+    # Sort by elevation descending, take top N
+    result.sort(key=lambda m: m["elevation"], reverse=True)
+    result = result[:num_mountains]
+    print(f"  Loaded {len(result)} mountains: {', '.join(m['name'] + ' (' + str(m['catalog_elev']) + 'm)' for m in result)}")
+    return result
+
+
+def project_mountains_to_frame(mountains, dem_path, new_w, new_h, off_x, off_y):
+    """Convert mountain lon/lat to video frame pixel coordinates."""
+    if not mountains:
+        return []
+    with rasterio.open(dem_path) as src:
+        dem_h, dem_w = src.height, src.width
+        scale = min(WIDTH / dem_w, HEIGHT / dem_h)
+        for mt in mountains:
+            py, px = src.index(mt["lon"], mt["lat"])
+            mt["frame_x"] = int(px * scale) + off_x
+            mt["frame_y"] = int(py * scale) + off_y
+    return mountains
+
+
+def resolve_mountain_label_positions(mountains, cities, font_mt):
+    """Pre-compute non-overlapping label positions for mountains,
+    taking existing city markers and labels into account."""
+    if not mountains or font_mt is None:
+        return
+    s = UI_SCALE
+    pad = int(3 * s)
+    offset = int(8 * s)
+    tri_half = max(3, int(5 * s))
+
+    # Start with placed_boxes from cities (dots + labels)
+    placed_boxes = []
+    if cities:
+        dot_r = max(2, int(4 * s)) + pad
+        for city in cities:
+            fx, fy = city["frame_x"], city["frame_y"]
+            placed_boxes.append((fx - dot_r, fy - dot_r, fx + dot_r, fy + dot_r))
+            # Also reserve city label boxes
+            if "label_x" in city and "label_y" in city:
+                lx, ly = city["label_x"], city["label_y"]
+                bbox = font_mt.getbbox(city["name"])
+                tw = bbox[2] - bbox[0]
+                th = bbox[3] - bbox[1]
+                placed_boxes.append((lx - pad, ly - pad, lx + tw + pad, ly + th + pad))
+
+    # Reserve all mountain triangle markers first
+    for mt in mountains:
+        fx, fy = mt["frame_x"], mt["frame_y"]
+        placed_boxes.append((fx - tri_half - pad, fy - tri_half - pad,
+                             fx + tri_half + pad, fy + tri_half + pad))
+
+    for mt in mountains:
+        fx, fy = mt["frame_x"], mt["frame_y"]
+        name = f"{mt['name']} ({mt['catalog_elev']}m)"
+        mt["display_name"] = name
+        bbox = font_mt.getbbox(name)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+
+        candidates = [
+            ( offset,             -th // 2),
+            (-offset - tw,        -th // 2),
+            (-tw // 2,            -offset - th),
+            (-tw // 2,             offset),
+            ( offset,             -offset - th),
+            ( offset,              offset),
+            (-offset - tw,        -offset - th),
+            (-offset - tw,         offset),
+        ]
+
+        best_pos = None
+        best_overlap = float('inf')
+        best_box = None
+
+        for dx, dy in candidates:
+            tx, ty = fx + dx, fy + dy
+            box = (tx - pad, ty - pad, tx + tw + pad, ty + th + pad)
+            if box[0] < 0 or box[1] < 0 or box[2] > WIDTH or box[3] > HEIGHT:
+                continue
+            overlap = 0
+            for pb in placed_boxes:
+                ix1 = max(box[0], pb[0])
+                iy1 = max(box[1], pb[1])
+                ix2 = min(box[2], pb[2])
+                iy2 = min(box[3], pb[3])
+                if ix1 < ix2 and iy1 < iy2:
+                    overlap += (ix2 - ix1) * (iy2 - iy1)
+            if overlap < best_overlap:
+                best_overlap = overlap
+                best_pos = (tx, ty)
+                best_box = box
+                if overlap == 0:
+                    break
+
+        if best_pos is None:
+            tx, ty = fx + offset, fy - th // 2
+            best_pos = (tx, ty)
+            best_box = (tx - pad, ty - pad, tx + tw + pad, ty + th + pad)
+
+        mt["label_x"] = best_pos[0]
+        mt["label_y"] = best_pos[1]
+        placed_boxes.append(best_box)
+
+
+def draw_mountains_on_frame(draw, mountains, sea_level, font_mt):
+    """Draw mountain markers (filled white triangles) and labels."""
+    if not mountains:
+        return
+    s = UI_SCALE
+    tri_half = max(3, int(5 * s))
+    tri_h = max(5, int(9 * s))
+    shadow = max(1, int(2 * s))
+    for mt in mountains:
+        fx, fy = mt["frame_x"], mt["frame_y"]
+        if fx < 0 or fx >= WIDTH or fy < 0 or fy >= HEIGHT:
+            continue
+        white = (255, 255, 255)
+        # Filled white triangle (pointing up)
+        triangle = [
+            (fx, fy - tri_h),              # top
+            (fx - tri_half, fy),           # bottom-left
+            (fx + tri_half, fy),           # bottom-right
+        ]
+        draw.polygon(triangle, fill=white, outline=None)
+        # Draw label
+        tx = mt["label_x"]
+        ty = mt["label_y"]
+        name = mt["display_name"]
+        draw.text((tx + shadow, ty + shadow), name, font=font_mt, fill=(0, 0, 0))
+        draw.text((tx, ty), name, font=font_mt, fill=white)
+
+
 def pick_tick_step(sea_range):
     """Pick a readable axis tick step based on the sea-level range."""
     if sea_range <= 20:
@@ -664,6 +894,8 @@ def parse_args():
                         help="Video duration in seconds. Overrides --sea-step.")
     parser.add_argument("--cities", type=int, default=0,
                         help="Show top N cities by population (e.g. --cities 10). Default: 0 (off).")
+    parser.add_argument("--mountains", type=int, default=0,
+                        help="Show top N famous mountains (e.g. --mountains 5). Default: 0 (off).")
     return parser.parse_args()
 
 
@@ -860,18 +1092,22 @@ def main():
     # Load fonts
     fonts = load_fonts()
     font_city = None
-    if args.cities > 0:
+    font_mt = None
+    if args.cities > 0 or args.mountains > 0:
         scale = UI_SCALE
         for fp in ["C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/arial.ttf",
                    "C:/Windows/Fonts/calibri.ttf"]:
             if os.path.exists(fp):
                 try:
                     font_city = ImageFont.truetype(fp, int(28 * scale))
+                    font_mt = ImageFont.truetype(fp, int(24 * scale))
                     break
                 except Exception:
                     continue
         if font_city is None:
             font_city = ImageFont.load_default()
+        if font_mt is None:
+            font_mt = font_city
 
     # Pre-compute resize dimensions
     new_w, new_h, off_x, off_y = precompute_scaled_dims(dem_np.shape)
@@ -883,6 +1119,14 @@ def main():
         city_data = load_cities(country_name, dem_path, args.cities)
         city_data = project_cities_to_frame(city_data, dem_path, new_w, new_h, off_x, off_y)
         resolve_city_label_positions(city_data, font_city)
+
+    # Load mountains if requested
+    mountain_data = []
+    if args.mountains > 0:
+        print(f"Loading top {args.mountains} mountains...")
+        mountain_data = load_mountains(country_name, dem_path, args.mountains)
+        mountain_data = project_mountains_to_frame(mountain_data, dem_path, new_w, new_h, off_x, off_y)
+        resolve_mountain_label_positions(mountain_data, city_data, font_mt)
 
     # Pre-render background frame
     bg_frame = Image.new('RGB', (WIDTH, HEIGHT), tuple(OCEAN_COLOR_DEEP))
@@ -943,6 +1187,9 @@ def main():
         if city_data and font_city:
             draw = ImageDraw.Draw(frame_img)
             draw_cities_on_frame(draw, city_data, sl, font_city)
+        if mountain_data and font_mt:
+            draw = ImageDraw.Draw(frame_img)
+            draw_mountains_on_frame(draw, mountain_data, sl, font_mt)
         frame_img.save(preview_path)
         print(f"Preview saved to: {preview_path}")
         return
@@ -1016,6 +1263,9 @@ def main():
         if city_data and font_city:
             draw = ImageDraw.Draw(frame_img)
             draw_cities_on_frame(draw, city_data, sl, font_city)
+        if mountain_data and font_mt:
+            draw = ImageDraw.Draw(frame_img)
+            draw_mountains_on_frame(draw, mountain_data, sl, font_mt)
 
         # Fade-to-black
         if i < fade_in_frames:
