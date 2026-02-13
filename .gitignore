@@ -31,3 +31,7 @@ preview*.png
 nul
 Thumbs.db
 .DS_Store
+
+# FFmpeg binaries
+ffmpeg_bin/
+ffmpeg.zip

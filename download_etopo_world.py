@@ -89,6 +89,11 @@ def download_tiles_parallel(tile_names, out_dir, workers, timeout, retries):
 def merge_tiles(tile_paths, output_path, mem_limit):
     print("Merging tiles (this can take a while)...")
     datasets = [rasterio.open(p) for p in tile_paths]
+    # Use the nodata value from the source tiles (ETOPO uses -99999)
+    src_nodata = datasets[0].nodata
+    if src_nodata is None:
+        src_nodata = -99999
+    print(f"  Source nodata: {src_nodata}")
     profile = datasets[0].profile.copy()
     profile.update(
         driver="GTiff",
@@ -97,12 +102,12 @@ def merge_tiles(tile_paths, output_path, mem_limit):
         blockxsize=512,
         blockysize=512,
         bigtiff="yes",
-        nodata=-9999,
+        nodata=src_nodata,
     )
     merge(
         datasets,
         dst_path=str(output_path),
-        nodata=-9999,
+        nodata=src_nodata,
         mem_limit=mem_limit,
         dst_kwds=profile,
     )

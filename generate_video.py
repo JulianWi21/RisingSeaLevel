@@ -40,6 +40,10 @@ SEA_LEVEL_MIN = 0
 SEA_LEVEL_MAX = 2000
 SEA_LEVEL_STEP = 0.25  # meters per frame
 MONT_BLANC_ELEVATION_M = 4809
+GROSSGLOCKNER_ELEVATION_M = 3798
+FADE_DURATION_SEC = 2.0  # fade-to-black at start/end of video
+HOLD_START_SEC = 1.0     # hold at sea_min after fade-in
+HOLD_END_SEC = 5.0       # hold at sea_max before fade-out
 
 # Color scheme
 OCEAN_COLOR_DEEP = [40, 80, 160]
@@ -119,8 +123,10 @@ def load_dem_data(dem_path):
     if nodata is not None:
         dem[dem == nodata] = np.nan
     dem[dem < -500] = np.nan
-    print(f"DEM loaded: {dem.shape}, range: {np.nanmin(dem):.0f}m to {np.nanmax(dem):.0f}m")
-    return dem, bounds
+    dem_min = float(np.nanmin(dem))
+    dem_max = float(np.nanmax(dem))
+    print(f"DEM loaded: {dem.shape}, range: {dem_min:.0f}m to {dem_max:.0f}m")
+    return dem, bounds, dem_min, dem_max
 
 
 def download_if_missing(filename, url):
@@ -282,7 +288,7 @@ def load_fonts():
         if os.path.exists(fp):
             try:
                 return (ImageFont.truetype(fp, int(72 * scale)),
-                        ImageFont.truetype(fp, int(32 * scale)),
+                        ImageFont.truetype(fp, int(48 * scale)),
                         ImageFont.truetype(fp, int(18 * scale)))
             except Exception:
                 continue
@@ -305,35 +311,6 @@ def draw_text_on_frame(frame_img, sea_level, fonts, sea_min, sea_max, ui_tick_st
     label = "Sea Level"
     draw.text((x + shadow, y + int(82 * s) + shadow), label, font=font_small, fill=(0, 0, 0))
     draw.text((x, y + int(80 * s)), label, font=font_small, fill=(220, 220, 220))
-
-    bar_y = HEIGHT - int(40 * s)
-    bar_h = max(2, int(8 * s))
-    bar_margin = int(50 * s)
-    bar_width = WIDTH - 2 * bar_margin
-    denom = max(1e-6, sea_max - sea_min)
-    progress = np.clip((sea_level - sea_min) / denom, 0.0, 1.0)
-
-    draw.rectangle([bar_margin, bar_y, bar_margin + bar_width, bar_y + bar_h], fill=(40, 40, 40))
-    fill_width = int(bar_width * progress)
-    if fill_width > 0:
-        draw.rectangle([bar_margin, bar_y, bar_margin + fill_width, bar_y + bar_h], fill=(100, 180, 255))
-
-    tick_step = ui_tick_step if ui_tick_step is not None else pick_tick_step(sea_max - sea_min)
-    if tick_step <= 0:
-        tick_step = pick_tick_step(sea_max - sea_min)
-    start_tick = int(np.ceil(sea_min / tick_step) * tick_step)
-    end_tick = int(np.floor(sea_max / tick_step) * tick_step)
-    if end_tick < start_tick:
-        start_tick = int(sea_min)
-        end_tick = int(sea_max)
-    for lv in range(start_tick, end_tick + 1, tick_step):
-        lx = bar_margin + int(bar_width * ((lv - sea_min) / denom))
-        tick = max(1, int(4 * s))
-        draw.line([(lx, bar_y - tick), (lx, bar_y + bar_h + tick)], fill=(150, 150, 150), width=max(1, int(1 * s)))
-        lt = f"{lv}m"
-        bbox = draw.textbbox((0, 0), lt, font=small_font)
-        tw = bbox[2] - bbox[0]
-        draw.text((lx - tw // 2, bar_y + bar_h + int(6 * s)), lt, font=small_font, fill=(180, 180, 180))
 
 
 def pick_tick_step(sea_range):
@@ -359,8 +336,13 @@ def build_sea_levels(sea_min, sea_max, sea_step, curve):
         return np.array([float(sea_min)], dtype=np.float32)
     frame_count = max(2, int(round((sea_max - sea_min) / sea_step)) + 1)
     t = np.linspace(0.0, 1.0, frame_count, dtype=np.float32)
-    if curve == "quadratic":
+    if curve == "easein":
+        # Gentle acceleration: starts with visible movement, ends 19x faster.
+        shaped = 0.1 * t + 0.9 * t ** 2
+    elif curve == "quadratic":
         shaped = t ** 2
+    elif curve == "cubic":
+        shaped = t ** 3
     elif curve == "log":
         # Fast early rise, then flatten (classic logarithmic progression).
         k = 9.0
@@ -484,18 +466,26 @@ def parse_args():
     parser.add_argument("--preview", default=None, help="Write a single PNG preview and exit.")
     parser.add_argument("--preview-level", type=float, default=None,
                         help="Sea level for preview in meters (default: SEA_LEVEL_MIN).")
-    parser.add_argument("--sea-min", type=float, default=SEA_LEVEL_MIN,
-                        help=f"Minimum sea level in meters (default: {SEA_LEVEL_MIN}).")
+    parser.add_argument("--sea-min", type=float, default=None,
+                        help=f"Minimum sea level in meters (default: DEM min elevation).")
     parser.add_argument("--sea-max", type=float, default=None,
                         help=f"Maximum sea level in meters (default: {SEA_LEVEL_MAX}).")
     parser.add_argument("--sea-max-montblanc", action="store_true",
                         help=f"Use Mont Blanc elevation as max sea level ({MONT_BLANC_ELEVATION_M}m).")
     parser.add_argument("--sea-step", type=float, default=SEA_LEVEL_STEP,
                         help=f"Step in meters used to determine frame count (default: {SEA_LEVEL_STEP}).")
-    parser.add_argument("--sea-curve", choices=["linear", "quadratic", "log"], default="linear",
+    parser.add_argument("--sea-curve", choices=["linear", "easein", "quadratic", "cubic", "log"], default="linear",
                         help="Sea-level growth curve over time.")
     parser.add_argument("--ui-tick-step", type=int, default=None,
                         help="Fixed tick step (meters) for the bottom scale. Default: auto.")
+    parser.add_argument("--width", type=int, default=None,
+                        help="Video width in pixels (default: 3840).")
+    parser.add_argument("--height", type=int, default=None,
+                        help="Video height in pixels (default: 2160).")
+    parser.add_argument("--fps", type=int, default=None,
+                        help="Frames per second (default: 60).")
+    parser.add_argument("--duration", type=float, default=None,
+                        help="Video duration in seconds. Overrides --sea-step.")
     return parser.parse_args()
 
 
@@ -528,6 +518,16 @@ def main():
     args = parse_args()
     if args.country_opt and args.country and args.country_opt != args.country:
         print("Warning: both positional and --country provided; using --country.")
+    # Override globals if CLI args provided
+    global WIDTH, HEIGHT, FPS, UI_SCALE
+    if args.width is not None:
+        WIDTH = args.width
+    if args.height is not None:
+        HEIGHT = args.height
+    if args.fps is not None:
+        FPS = args.fps
+    UI_SCALE = min(WIDTH / 1920, HEIGHT / 1080)
+
     country_name = args.country_opt or args.country or DEFAULT_COUNTRY
     country_slug = slugify(country_name)
     country_dir = os.path.join(DATA_DIR, country_slug)
@@ -577,7 +577,7 @@ def main():
 
     # Load data
     print("Loading DEM data...")
-    dem_np, bounds = load_dem_data(dem_path)
+    dem_np, bounds, dem_elev_min, dem_elev_max = load_dem_data(dem_path)
 
     # Compute pixel size for resolution-aware hillshade
     with rasterio.open(dem_path) as src:
@@ -639,15 +639,23 @@ def main():
     noise_np = gaussian_filter(noise_np, sigma=5)
     ocean_noise_gpu = torch.from_numpy(noise_np).to(DEVICE, dtype=torch.float32)
 
-    # Sea levels
-    sea_min = float(args.sea_min)
+    # Sea levels — auto-detect from DEM if not explicitly set
+    sea_min = float(args.sea_min) if args.sea_min is not None else dem_elev_min
     if args.sea_max_montblanc:
         sea_max = float(MONT_BLANC_ELEVATION_M)
     elif args.sea_max is not None:
         sea_max = float(args.sea_max)
     else:
-        sea_max = float(SEA_LEVEL_MAX)
+        # Use true peak elevation for Austria (ETOPO is too coarse for Großglockner)
+        if country_name.lower() == "austria" and dem_elev_max < GROSSGLOCKNER_ELEVATION_M:
+            sea_max = float(GROSSGLOCKNER_ELEVATION_M)
+        else:
+            sea_max = dem_elev_max
     sea_step = float(args.sea_step)
+    if args.duration is not None:
+        total_frames_target = max(2, int(round(args.duration * FPS)))
+        sea_step = max(0.001, (sea_max - sea_min) / (total_frames_target - 1))
+        print(f"Duration {args.duration}s -> {total_frames_target} frames, sea_step={sea_step:.3f}m")
     if sea_step <= 0:
         print("ERROR: --sea-step must be > 0.")
         sys.exit(1)
@@ -655,13 +663,20 @@ def main():
         print("ERROR: --sea-max must be >= --sea-min.")
         sys.exit(1)
     sea_levels = build_sea_levels(sea_min, sea_max, sea_step, args.sea_curve)
-    total_frames = len(sea_levels)
+    rise_frames = len(sea_levels)
+    fade_in_frames = int(FADE_DURATION_SEC * FPS)
+    hold_start_frames = int(HOLD_START_SEC * FPS)
+    hold_end_frames = int(HOLD_END_SEC * FPS)
+    fade_out_frames = int(FADE_DURATION_SEC * FPS)
+    total_frames = fade_in_frames + hold_start_frames + rise_frames + hold_end_frames + fade_out_frames
     duration_sec = total_frames / FPS
     print(
         f"\nSea levels: {sea_min:.1f}m -> {sea_max:.1f}m "
         f"({args.sea_curve}, base step {sea_step}m)"
     )
-    print(f"Total frames: {total_frames}")
+    print(f"Rise frames: {rise_frames}, total frames: {total_frames}")
+    print(f"  Fade-in: {FADE_DURATION_SEC}s, Hold start: {HOLD_START_SEC}s, "
+          f"Hold end: {HOLD_END_SEC}s, Fade-out: {FADE_DURATION_SEC}s")
     print(f"Video duration: {duration_sec:.1f}s at {FPS}fps")
 
     # Load fonts
@@ -753,26 +768,59 @@ def main():
     print("Generating frames...\n")
     t_start = time.time()
 
-    for i, sea_level in enumerate(sea_levels):
-        sl = float(sea_level)
+    # Phase boundaries (cumulative frame indices)
+    phase1_end = fade_in_frames                          # end of fade-in
+    phase2_end = phase1_end + hold_start_frames           # end of hold-start
+    phase3_end = phase2_end + rise_frames                 # end of sea-level rise
+    phase4_end = phase3_end + hold_end_frames             # end of hold-end
+    # phase5 = fade-out until total_frames
 
-        # Render on GPU
-        img_gpu = render_frame_gpu(
-            dem_gpu, is_nodata_gpu, sl, terrain_lut_gpu,
-            rivers_mask_gpu, lakes_mask_gpu, lake_rim_weight_gpu,
-            hillshade_gpu, ocean_noise_gpu, shore_t, deep_t, river_t, deep_bg_t
-        )
+    last_img_gpu = None  # cache for hold phases
 
-        # Resize to frame
-        img_small = resize_to_frame(img_gpu)
+    for i in range(total_frames):
+        # Determine sea level for this frame
+        if i < phase2_end:
+            sl = sea_min          # fade-in + hold-start: stay at sea_min
+            rise_idx = 0
+        elif i < phase3_end:
+            rise_idx = i - phase2_end
+            sl = float(sea_levels[rise_idx])
+        else:
+            sl = sea_max          # hold-end + fade-out: stay at sea_max
+            rise_idx = rise_frames - 1
 
-        # Compose into 1920x1080 frame
-        frame_array = bg_array.copy()
-        frame_array[off_y:off_y + new_h, off_x:off_x + new_w] = img_small
+        # Only re-render when sea level actually changes
+        need_render = (last_img_gpu is None
+                       or (i >= phase2_end and i < phase3_end)  # during rise
+                       or i == phase2_end  # first rise frame
+                       or i == phase3_end) # first hold-end frame
+        if need_render:
+            img_gpu = render_frame_gpu(
+                dem_gpu, is_nodata_gpu, sl, terrain_lut_gpu,
+                rivers_mask_gpu, lakes_mask_gpu, lake_rim_weight_gpu,
+                hillshade_gpu, ocean_noise_gpu, shore_t, deep_t, river_t, deep_bg_t
+            )
+            img_small = resize_to_frame(img_gpu)
+            cached_frame = bg_array.copy()
+            cached_frame[off_y:off_y + new_h, off_x:off_x + new_w] = img_small
+            last_img_gpu = cached_frame
 
-        # Draw text overlay directly
+        # Compose frame
+        frame_array = last_img_gpu.copy()
         frame_img = Image.fromarray(frame_array)
         draw_text_on_frame(frame_img, sl, fonts, sea_min, sea_max)
+
+        # Fade-to-black
+        if i < fade_in_frames:
+            alpha = i / fade_in_frames
+            faded = (np.array(frame_img, dtype=np.float32) * alpha).astype(np.uint8)
+            frame_img = Image.fromarray(faded)
+        elif i >= phase4_end:
+            frames_into_fade = i - phase4_end
+            alpha = 1.0 - frames_into_fade / fade_out_frames
+            alpha = max(0.0, alpha)
+            faded = (np.array(frame_img, dtype=np.float32) * alpha).astype(np.uint8)
+            frame_img = Image.fromarray(faded)
 
         # Write raw RGB bytes to ffmpeg
         ffmpeg_proc.stdin.write(frame_img.tobytes())
