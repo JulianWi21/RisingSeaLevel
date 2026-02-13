@@ -313,6 +313,176 @@ def draw_text_on_frame(frame_img, sea_level, fonts, sea_min, sea_max, ui_tick_st
     draw.text((x, y + int(80 * s)), label, font=font_small, fill=(220, 220, 220))
 
 
+def load_cities(country_name, dem_path, num_cities=10):
+    """Load top N cities for a country from Natural Earth populated places.
+    Returns list of dicts with name, lon, lat, population, elevation (from DEM)."""
+    places_file = os.path.join(DATA_DIR, "ne_10m_populated_places.zip")
+    url = "https://naciscdn.org/naturalearth/10m/cultural/ne_10m_populated_places.zip"
+    if not os.path.exists(places_file):
+        print(f"  Downloading populated places...")
+        try:
+            urllib.request.urlretrieve(url, places_file)
+        except Exception:
+            # Fallback: try downloading with PowerShell on Windows
+            import platform
+            if platform.system() == "Windows":
+                subprocess.run(
+                    ["powershell", "-Command",
+                     f"Invoke-WebRequest -Uri '{url}' -OutFile '{places_file}'"],
+                    check=True, capture_output=True
+                )
+            else:
+                raise
+    places = gpd.read_file(f"zip://{places_file}")
+    places = places.to_crs("EPSG:4326")
+    # Match country
+    name_lower = country_name.strip().lower()
+    matched = None
+    for col in ["SOV0NAME", "ADM0NAME", "ADM0_A3"]:
+        if col in places.columns:
+            series = places[col].fillna("").astype(str).str.lower()
+            m = places[series == name_lower]
+            if not m.empty:
+                matched = m
+                break
+    if matched is None or matched.empty:
+        print(f"  Warning: No cities found for '{country_name}'.")
+        return []
+    # Sort by population
+    pop_col = None
+    for c in ["POP_MAX", "POP_MIN", "GN_POP"]:
+        if c in matched.columns:
+            pop_col = c
+            break
+    if pop_col:
+        matched = matched.sort_values(pop_col, ascending=False)
+    cities = matched.head(num_cities)
+    # Get elevation from DEM for each city
+    result = []
+    with rasterio.open(dem_path) as src:
+        dem_data = src.read(1)
+        for _, row in cities.iterrows():
+            lon, lat = row.geometry.x, row.geometry.y
+            try:
+                py, px = src.index(lon, lat)
+                if 0 <= py < src.height and 0 <= px < src.width:
+                    elev = float(dem_data[py, px])
+                    if elev < -500 or (src.nodata is not None and dem_data[py, px] == src.nodata):
+                        elev = 0.0
+                else:
+                    elev = 0.0
+            except Exception:
+                elev = 0.0
+            name = row.get("NAME", row.get("NAME_EN", "?"))
+            pop = int(row.get(pop_col, 0)) if pop_col else 0
+            result.append({"name": name, "lon": lon, "lat": lat,
+                           "population": pop, "elevation": elev})
+    print(f"  Loaded {len(result)} cities: {', '.join(c['name'] for c in result)}")
+    return result
+
+
+def project_cities_to_frame(cities, dem_path, new_w, new_h, off_x, off_y):
+    """Convert city lon/lat to video frame pixel coordinates."""
+    if not cities:
+        return []
+    with rasterio.open(dem_path) as src:
+        dem_h, dem_w = src.height, src.width
+        scale = min(WIDTH / dem_w, HEIGHT / dem_h)
+        for city in cities:
+            py, px = src.index(city["lon"], city["lat"])
+            # Scale to resized frame
+            city["frame_x"] = int(px * scale) + off_x
+            city["frame_y"] = int(py * scale) + off_y
+    return cities
+
+
+def resolve_city_label_positions(cities, font_city):
+    """Pre-compute non-overlapping label positions for all cities."""
+    if not cities or font_city is None:
+        return
+    s = UI_SCALE
+    pad = int(3 * s)
+    offset = int(8 * s)
+
+    placed_boxes = []  # (x1, y1, x2, y2) of already-placed labels
+
+    for city in cities:
+        fx, fy = city["frame_x"], city["frame_y"]
+        name = city["name"]
+        bbox = font_city.getbbox(name)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+
+        # 8 candidate offsets (dx, dy) relative to dot
+        candidates = [
+            ( offset,             -th // 2),            # right
+            (-offset - tw,        -th // 2),            # left
+            (-tw // 2,            -offset - th),        # above
+            (-tw // 2,             offset),             # below
+            ( offset,             -offset - th),        # upper-right
+            ( offset,              offset),             # lower-right
+            (-offset - tw,        -offset - th),        # upper-left
+            (-offset - tw,         offset),             # lower-left
+        ]
+
+        best_pos = None
+        best_overlap = float('inf')
+        best_box = None
+
+        for dx, dy in candidates:
+            tx, ty = fx + dx, fy + dy
+            box = (tx - pad, ty - pad, tx + tw + pad, ty + th + pad)
+            # Prefer positions inside the frame
+            if box[0] < 0 or box[1] < 0 or box[2] > WIDTH or box[3] > HEIGHT:
+                continue
+            overlap = 0
+            for pb in placed_boxes:
+                ix1 = max(box[0], pb[0])
+                iy1 = max(box[1], pb[1])
+                ix2 = min(box[2], pb[2])
+                iy2 = min(box[3], pb[3])
+                if ix1 < ix2 and iy1 < iy2:
+                    overlap += (ix2 - ix1) * (iy2 - iy1)
+            if overlap < best_overlap:
+                best_overlap = overlap
+                best_pos = (tx, ty)
+                best_box = box
+                if overlap == 0:
+                    break
+
+        if best_pos is None:
+            # All candidates were outside the frame; fall back to right
+            tx, ty = fx + offset, fy - th // 2
+            best_pos = (tx, ty)
+            best_box = (tx - pad, ty - pad, tx + tw + pad, ty + th + pad)
+
+        city["label_x"] = best_pos[0]
+        city["label_y"] = best_pos[1]
+        placed_boxes.append(best_box)
+
+
+def draw_cities_on_frame(draw, cities, sea_level, font_city):
+    """Draw city markers and labels. Cities always stay visible."""
+    s = UI_SCALE
+    dot_r = max(2, int(4 * s))
+    shadow = max(1, int(2 * s))
+    for city in cities:
+        fx, fy = city["frame_x"], city["frame_y"]
+        name = city["name"]
+        # Skip if outside frame
+        if fx < 0 or fx >= WIDTH or fy < 0 or fy >= HEIGHT:
+            continue
+        white = (255, 255, 255)
+        # Draw dot
+        draw.ellipse([fx - dot_r, fy - dot_r, fx + dot_r, fy + dot_r],
+                     fill=white, outline=None)
+        # Draw label at pre-computed position
+        tx = city["label_x"]
+        ty = city["label_y"]
+        draw.text((tx + shadow, ty + shadow), name, font=font_city, fill=(0, 0, 0))
+        draw.text((tx, ty), name, font=font_city, fill=white)
+
+
 def pick_tick_step(sea_range):
     """Pick a readable axis tick step based on the sea-level range."""
     if sea_range <= 20:
@@ -474,8 +644,8 @@ def parse_args():
                         help=f"Use Mont Blanc elevation as max sea level ({MONT_BLANC_ELEVATION_M}m).")
     parser.add_argument("--sea-step", type=float, default=SEA_LEVEL_STEP,
                         help=f"Step in meters used to determine frame count (default: {SEA_LEVEL_STEP}).")
-    parser.add_argument("--sea-curve", choices=["linear", "easein", "quadratic", "cubic", "log"], default="linear",
-                        help="Sea-level growth curve over time.")
+    parser.add_argument("--sea-curve", choices=["linear", "easein", "quadratic", "cubic", "log"], default="easein",
+                        help="Sea-level growth curve over time (default: easein).")
     parser.add_argument("--ui-tick-step", type=int, default=None,
                         help="Fixed tick step (meters) for the bottom scale. Default: auto.")
     parser.add_argument("--width", type=int, default=None,
@@ -486,6 +656,8 @@ def parse_args():
                         help="Frames per second (default: 60).")
     parser.add_argument("--duration", type=float, default=None,
                         help="Video duration in seconds. Overrides --sea-step.")
+    parser.add_argument("--cities", type=int, default=0,
+                        help="Show top N cities by population (e.g. --cities 10). Default: 0 (off).")
     return parser.parse_args()
 
 
@@ -681,9 +853,30 @@ def main():
 
     # Load fonts
     fonts = load_fonts()
+    font_city = None
+    if args.cities > 0:
+        scale = UI_SCALE
+        for fp in ["C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/arial.ttf",
+                   "C:/Windows/Fonts/calibri.ttf"]:
+            if os.path.exists(fp):
+                try:
+                    font_city = ImageFont.truetype(fp, int(28 * scale))
+                    break
+                except Exception:
+                    continue
+        if font_city is None:
+            font_city = ImageFont.load_default()
 
     # Pre-compute resize dimensions
     new_w, new_h, off_x, off_y = precompute_scaled_dims(dem_np.shape)
+
+    # Load cities if requested
+    city_data = []
+    if args.cities > 0:
+        print(f"Loading top {args.cities} cities...")
+        city_data = load_cities(country_name, dem_path, args.cities)
+        city_data = project_cities_to_frame(city_data, dem_path, new_w, new_h, off_x, off_y)
+        resolve_city_label_positions(city_data, font_city)
 
     # Pre-render background frame
     bg_frame = Image.new('RGB', (WIDTH, HEIGHT), tuple(OCEAN_COLOR_DEEP))
@@ -741,6 +934,9 @@ def main():
 
         frame_img = Image.fromarray(frame_array)
         draw_text_on_frame(frame_img, sl, fonts, sea_min, sea_max)
+        if city_data and font_city:
+            draw = ImageDraw.Draw(frame_img)
+            draw_cities_on_frame(draw, city_data, sl, font_city)
         frame_img.save(preview_path)
         print(f"Preview saved to: {preview_path}")
         return
@@ -762,8 +958,10 @@ def main():
         "-movflags", "+faststart",
         output_video
     ]
+    ffmpeg_log = os.path.join(os.path.dirname(output_video) or ".", "ffmpeg_log.txt")
+    ffmpeg_log_fh = open(ffmpeg_log, "w")
     ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE,
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                    stdout=subprocess.DEVNULL, stderr=ffmpeg_log_fh)
 
     print("Generating frames...\n")
     t_start = time.time()
@@ -809,6 +1007,9 @@ def main():
         frame_array = last_img_gpu.copy()
         frame_img = Image.fromarray(frame_array)
         draw_text_on_frame(frame_img, sl, fonts, sea_min, sea_max)
+        if city_data and font_city:
+            draw = ImageDraw.Draw(frame_img)
+            draw_cities_on_frame(draw, city_data, sl, font_city)
 
         # Fade-to-black
         if i < fade_in_frames:
@@ -836,9 +1037,28 @@ def main():
     # Close ffmpeg
     ffmpeg_proc.stdin.close()
     ffmpeg_proc.wait()
+    ffmpeg_log_fh.close()
+
+    # Read ffmpeg log
+    ffmpeg_stderr = ""
+    if os.path.exists(ffmpeg_log):
+        with open(ffmpeg_log, "r", errors="replace") as f:
+            ffmpeg_stderr = f.read()
 
     elapsed_total = time.time() - t_start
     print(f"\nAll frames generated in {elapsed_total:.1f}s ({total_frames / elapsed_total:.1f} fps)")
+
+    if ffmpeg_stderr:
+        # Show last 20 lines of ffmpeg output for debugging
+        lines = ffmpeg_stderr.strip().splitlines()
+        if len(lines) > 20:
+            print(f"\n[ffmpeg stderr - last 20 of {len(lines)} lines]")
+            for l in lines[-20:]:
+                print(f"  {l}")
+        else:
+            print(f"\n[ffmpeg stderr]")
+            for l in lines:
+                print(f"  {l}")
 
     if ffmpeg_proc.returncode == 0:
         size_mb = os.path.getsize(output_video) / (1024 * 1024)
@@ -846,6 +1066,9 @@ def main():
         print(f"File size: {size_mb:.1f} MB")
     else:
         print(f"FFmpeg failed with return code {ffmpeg_proc.returncode}")
+        if ffmpeg_stderr:
+            for l in ffmpeg_stderr.strip().splitlines()[-10:]:
+                print(f"  {l}")
         sys.exit(1)
 
     print("\n=== Done! ===")
