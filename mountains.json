@@ -76,10 +76,10 @@
   ],
   "sweden": [
     {"name": "Kebnekaise", "lat": 67.9035, "lon": 18.5468, "elev": 2097},
-    {"name": "Sarektjåkkå", "lat": 67.3967, "lon": 17.7253, "elev": 2089},
-    {"name": "Kaskasatjåkka", "lat": 67.89, "lon": 18.58, "elev": 2076},
-    {"name": "Stortoppen", "lat": 63.1536, "lon": 12.3697, "elev": 1762},
-    {"name": "Storsylen", "lat": 63.06, "lon": 12.2256, "elev": 1762}
+    {"name": "Åreskutan", "lat": 63.4303, "lon": 13.0903, "elev": 1420},
+    {"name": "Tomtabacken", "lat": 57.5003, "lon": 14.4697, "elev": 377},
+    {"name": "Städjan", "lat": 61.8883, "lon": 12.8586, "elev": 1131},
+    {"name": "Galtispuoda", "lat": 66.1156, "lon": 17.9358, "elev": 800}
   ],
   "finland": [
     {"name": "Halti", "lat": 69.2553, "lon": 25.7403, "elev": 1324},
@@ -266,5 +266,18 @@
     {"name": "Mount Hotaka", "lat": 36.2892, "lon": 137.6481, "elev": 3190},
     {"name": "Mount Yari", "lat": 36.3422, "lon": 137.6478, "elev": 3180},
     {"name": "Mount Ontake", "lat": 35.8931, "lon": 137.4803, "elev": 3067}
+  ],
+  "argentina": [
+  {"name": "Aconcagua", "lat": -32.6532, "lon": -70.0109, "elev": 6961},
+  {"name": "Monte Pissis", "lat": -27.7544, "lon": -68.7992, "elev": 6795},
+  {"name": "Cerro Bonete", "lat": -28.0186, "lon": -68.7567, "elev": 6759},
+  {"name": "Cerro Fitz Roy", "lat": -49.2711, "lon": -73.0431, "elev": 3405}
+  ],
+  "mexico": [
+  {"name": "Pico de Orizaba", "lat": 19.0305, "lon": -97.2698, "elev": 5636},
+  {"name": "Popocatépetl", "lat": 19.0225, "lon": -98.6278, "elev": 5426},
+  {"name": "Iztaccíhuatl", "lat": 19.1792, "lon": -98.6419, "elev": 5230},
+  {"name": "Nevado de Toluca", "lat": 19.1083, "lon": -99.7542, "elev": 4680},
+  {"name": "Malinche", "lat": 19.2314, "lon": -98.0319, "elev": 4461}
   ]
 }

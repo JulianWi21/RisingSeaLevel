@@ -350,89 +350,68 @@ PREFERRED_CITIES = {
 
 
 def load_cities(country_name, dem_path, num_cities=10):
-    """Load top N cities for a country from Natural Earth populated places.
-    Returns list of dicts with name, lon, lat, population, elevation (from DEM)."""
-    places_file = os.path.join(DATA_DIR, "ne_10m_populated_places.zip")
-    url = "https://naciscdn.org/naturalearth/10m/cultural/ne_10m_populated_places.zip"
-    if not os.path.exists(places_file):
-        print(f"  Downloading populated places...")
-        try:
-            urllib.request.urlretrieve(url, places_file)
-        except Exception:
-            # Fallback: try downloading with PowerShell on Windows
-            import platform
-            if platform.system() == "Windows":
-                subprocess.run(
-                    ["powershell", "-Command",
-                     f"Invoke-WebRequest -Uri '{url}' -OutFile '{places_file}'"],
-                    check=True, capture_output=True
-                )
-            else:
-                raise
-    places = gpd.read_file(f"zip://{places_file}")
-    places = places.to_crs("EPSG:4326")
-    # Match country
-    name_lower = country_name.strip().lower()
-    matched = None
-    for col in ["SOV0NAME", "ADM0NAME", "ADM0_A3"]:
-        if col in places.columns:
-            series = places[col].fillna("").astype(str).str.lower()
-            m = places[series == name_lower]
-            if not m.empty:
-                matched = m
-                break
-    if matched is None or matched.empty:
-        print(f"  Warning: No cities found for '{country_name}'.")
+    """
+    Lädt Städte direkt aus der cities.json und ergänzt die Höhenmeter aus dem DEM.
+    """
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    json_path = os.path.join(current_dir, "cities.json")
+    
+    if not os.path.exists(json_path):
+        print(f"  Warning: {json_path} nicht gefunden!")
         return []
-    # Sort by population
-    pop_col = None
-    for c in ["POP_MAX", "POP_MIN", "GN_POP"]:
-        if c in matched.columns:
-            pop_col = c
-            break
-    if pop_col:
-        matched = matched.sort_values(pop_col, ascending=False)
-    # Use preferred city list if available (for better geographic distribution)
-    preferred = PREFERRED_CITIES.get(name_lower, [])
-    if preferred:
-        preferred_lower = [n.lower() for n in preferred[:num_cities]]
-        name_col = "NAME" if "NAME" in matched.columns else ("NAME_EN" if "NAME_EN" in matched.columns else None)
-        if name_col:
-            chosen = []
-            for pname in preferred_lower:
-                hit = matched[matched[name_col].fillna("").astype(str).str.lower() == pname]
-                if not hit.empty:
-                    chosen.append(hit.iloc[0])
-            if chosen:
-                import pandas as _pd
-                cities = gpd.GeoDataFrame(chosen, crs=matched.crs)
-            else:
-                cities = matched.head(num_cities)
-        else:
-            cities = matched.head(num_cities)
-    else:
-        cities = matched.head(num_cities)
-    # Get elevation from DEM for each city
+
+    with open(json_path, 'r', encoding='utf-8') as f:
+        all_cities = json.load(f)
+
+    # Land in Kleinschreibung suchen (wie bei den Bergen)
+    name_lower = country_name.strip().lower()
+    city_list = all_cities.get(name_lower, [])
+
+    if not city_list:
+        print(f"  Warning: Keine Städte für '{country_name}' in JSON gefunden.")
+        return []
+
+    # Begrenzen auf die gewünschte Anzahl
+    chosen_cities = city_list[:num_cities]
+
     result = []
-    with rasterio.open(dem_path) as src:
-        dem_data = src.read(1)
-        for _, row in cities.iterrows():
-            lon, lat = row.geometry.x, row.geometry.y
-            try:
-                py, px = src.index(lon, lat)
-                if 0 <= py < src.height and 0 <= px < src.width:
-                    elev = float(dem_data[py, px])
-                    if elev < -500 or (src.nodata is not None and dem_data[py, px] == src.nodata):
-                        elev = 0.0
-                else:
-                    elev = 0.0
-            except Exception:
+    
+    # DEM öffnen, um die Höhenmeter für die Stadt-Koordinaten zu ziehen
+    try:
+        with rasterio.open(dem_path) as src:
+            dem_data = src.read(1)
+            nodata = src.nodata
+            
+            for city in chosen_cities:
+                lon, lat = city["lon"], city["lat"]
                 elev = 0.0
-            name = row.get("NAME", row.get("NAME_EN", "?"))
-            pop = int(row.get(pop_col, 0)) if pop_col else 0
-            result.append({"name": name, "lon": lon, "lat": lat,
-                           "population": pop, "elevation": elev})
-    print(f"  Loaded {len(result)} cities: {', '.join(c['name'] for c in result)}")
+                
+                try:
+                    py, px = src.index(lon, lat)
+                    if 0 <= py < src.height and 0 <= px < src.width:
+                        val = dem_data[py, px]
+                        if val != nodata and val > -500:
+                            elev = float(val)
+                except Exception:
+                    pass # Falls Koordinate außerhalb des DEM liegt
+                
+                result.append({
+                    "name": city["name"],
+                    "lon": lon,
+                    "lat": lat,
+                    "population": city.get("pop", 0),
+                    "elevation": elev
+                })
+    except Exception as e:
+        print(f"  Error reading DEM for cities: {e}")
+        # Fallback ohne Höhenmeter
+        for city in chosen_cities:
+            result.append({
+                "name": city["name"], "lon": city["lon"], "lat": city["lat"],
+                "population": city.get("pop", 0), "elevation": 0.0
+            })
+
+    print(f"  Loaded {len(result)} cities from JSON: {', '.join(c['name'] for c in result)}")
     return result
 
 
