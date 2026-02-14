@@ -60,9 +60,9 @@ HOLD_START_SEC = 1.0     # hold at sea_min after fade-in
 HOLD_END_SEC = 5.0       # hold at sea_max before fade-out
 
 # Color scheme
-OCEAN_COLOR_DEEP = [40, 80, 160]
-OCEAN_COLOR_SHORE = [100, 160, 220]
-RIVER_COLOR = [40, 80, 160]
+OCEAN_COLOR_DEEP = [60, 110, 185]
+OCEAN_COLOR_SHORE = [120, 180, 235]
+RIVER_COLOR = [60, 110, 185]
 LAKE_SHORE_PX = 20          # rim width in pixels (at SRTM 90m ref resolution)
 
 # Terrain colormap
@@ -327,6 +327,27 @@ def draw_text_on_frame(frame_img, sea_level, fonts, sea_min, sea_max, ui_tick_st
     draw.text((x, y + int(80 * s)), label, font=font_small, fill=(220, 220, 220))
 
 
+# Hand-picked cities for countries where population-based selection
+# clusters too much in one region. These are chosen for good geographic spread.
+PREFERRED_CITIES = {
+    "sweden": [
+        "Stockholm", "Göteborg", "Malmö", "Uppsala",
+        "Umeå", "Luleå", "Sundsvall", "Östersund",
+        "Kiruna", "Gävle",
+    ],
+    "finland": [
+        "Helsinki", "Tampere", "Turku", "Oulu",
+        "Jyväskylä", "Kuopio", "Rovaniemi", "Vaasa",
+        "Joensuu", "Sodankylä",
+    ],
+    "norway": [
+        "Oslo", "Bergen", "Trondheim", "Stavanger",
+        "Tromsø", "Bodø", "Kristiansand", "Ålesund",
+        "Hammerfest", "Drammen",
+    ],
+}
+
+
 def load_cities(country_name, dem_path, num_cities=10):
     """Load top N cities for a country from Natural Earth populated places.
     Returns list of dicts with name, lon, lat, population, elevation (from DEM)."""
@@ -370,7 +391,26 @@ def load_cities(country_name, dem_path, num_cities=10):
             break
     if pop_col:
         matched = matched.sort_values(pop_col, ascending=False)
-    cities = matched.head(num_cities)
+    # Use preferred city list if available (for better geographic distribution)
+    preferred = PREFERRED_CITIES.get(name_lower, [])
+    if preferred:
+        preferred_lower = [n.lower() for n in preferred[:num_cities]]
+        name_col = "NAME" if "NAME" in matched.columns else ("NAME_EN" if "NAME_EN" in matched.columns else None)
+        if name_col:
+            chosen = []
+            for pname in preferred_lower:
+                hit = matched[matched[name_col].fillna("").astype(str).str.lower() == pname]
+                if not hit.empty:
+                    chosen.append(hit.iloc[0])
+            if chosen:
+                import pandas as _pd
+                cities = gpd.GeoDataFrame(chosen, crs=matched.crs)
+            else:
+                cities = matched.head(num_cities)
+        else:
+            cities = matched.head(num_cities)
+    else:
+        cities = matched.head(num_cities)
     # Get elevation from DEM for each city
     result = []
     with rasterio.open(dem_path) as src:
@@ -580,6 +620,27 @@ FAMOUS_MOUNTAINS = {
         {"name": "Deogyusan",     "lat": 35.8631, "lon": 127.7472, "elev": 1614},
         {"name": "Gayasan",       "lat": 35.8019, "lon": 128.1194, "elev": 1430},
         {"name": "Odaesan",       "lat": 37.7983, "lon": 128.5428, "elev": 1563},
+    ],
+    "sweden": [
+        {"name": "Kebnekaise",    "lat": 67.9035, "lon": 18.5468, "elev": 2097},
+        {"name": "Sarektjåkkå",   "lat": 67.3967, "lon": 17.7253, "elev": 2089},
+        {"name": "Kaskasatjåkka", "lat": 67.8900, "lon": 18.5800, "elev": 2076},
+        {"name": "Stortoppen",    "lat": 63.1536, "lon": 12.3697, "elev": 1762},
+        {"name": "Storsylen",     "lat": 63.0600, "lon": 12.2256, "elev": 1762},
+    ],
+    "finland": [
+        {"name": "Halti",         "lat": 69.2553, "lon": 25.7403, "elev": 1324},
+        {"name": "Ridnitsohkka",  "lat": 69.1056, "lon": 20.8617, "elev": 1317},
+        {"name": "Kovddoskaisi",  "lat": 69.2000, "lon": 25.6333, "elev": 1243},
+        {"name": "Saana",         "lat": 69.0428, "lon": 20.8431, "elev": 1029},
+        {"name": "Pallastunturi", "lat": 68.0667, "lon": 24.0667, "elev": 807},
+    ],
+    "norway": [
+        {"name": "Galdhøpiggen",  "lat": 61.6364, "lon": 8.3125,  "elev": 2469},
+        {"name": "Glittertind",   "lat": 61.6533, "lon": 8.3856,  "elev": 2452},
+        {"name": "Store Skagastølstind", "lat": 61.5172, "lon": 7.8142, "elev": 2405},
+        {"name": "Styggedalstind", "lat": 61.5253, "lon": 7.8036, "elev": 2387},
+        {"name": "Stetind",       "lat": 68.1483, "lon": 16.5983, "elev": 1392},
     ],
 }
 
@@ -1024,6 +1085,16 @@ def main():
         dem_tag = slugify(dem_base.replace("_dem_clipped", ""))
     is_resized_dem = re.search(r"_\d+x\d+_dem_clipped\.tif$", os.path.basename(dem_path)) is not None
     is_etopo_dem = "etopo" in os.path.basename(dem_path).lower()
+    is_copernicus_dem = "copernicus" in os.path.basename(dem_path).lower()
+    # Determine DEM source label for display
+    if is_etopo_dem:
+        dem_source = "ETOPO 2022 (NOAA, ~450m, Public Domain)"
+    elif is_copernicus_dem:
+        dem_source = "Copernicus GLO-90 (ESA/DLR, ~90m, attribution required)"
+    elif "srtm" in os.path.basename(dem_path).lower():
+        dem_source = "SRTM (CGIAR, ~90m, CC-BY 4.0)"
+    else:
+        dem_source = "Unknown"
     if is_etopo_dem:
         # Gentler land boost for coarse ETOPO DEMs (avoid oversaturation)
         globals()["LAND_BRIGHTNESS"] = LAND_BRIGHTNESS_ETOPO
@@ -1043,6 +1114,7 @@ def main():
         mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
         print(f"VRAM: {mem_gb:.1f} GB")
     print(f"DEM: {dem_path}")
+    print(f"DEM source: {dem_source}")
     print(f"Output: {output_video}")
     if preview_path:
         print(f"Preview: {preview_path}")
@@ -1113,7 +1185,7 @@ def main():
     ocean_noise_gpu = torch.from_numpy(noise_np).to(DEVICE, dtype=torch.float32)
 
     # Sea levels — auto-detect from DEM if not explicitly set
-    sea_min = float(args.sea_min) if args.sea_min is not None else dem_elev_min
+    sea_min = float(args.sea_min) if args.sea_min is not None else 0.0
     if args.sea_max_montblanc:
         sea_max = float(MONT_BLANC_ELEVATION_M)
     elif args.sea_max is not None:

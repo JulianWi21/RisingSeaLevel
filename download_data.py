@@ -1,9 +1,10 @@
 """
-Download elevation data (SRTM) and a country boundary for sea level rise visualization.
-Uses NASA SRTM data via direct tile downloads and Natural Earth boundaries.
+Download elevation data (ETOPO / Copernicus) and a country boundary for sea level rise visualization.
+Uses ETOPO 2022 (15 arc-second) by default.  Copernicus GLO-90 for high latitudes (>60°N / <56°S).
 """
 
 import os
+import sys
 import re
 import argparse
 import urllib.request
@@ -12,6 +13,18 @@ import io
 import numpy as np
 import rasterio
 import pandas as pd
+
+# Ensure SSL DLLs are findable (Anaconda-based venvs may need this)
+_anaconda_lib_bin = os.path.join(sys.prefix, "..", "Library", "bin")
+if not os.path.isdir(_anaconda_lib_bin):
+    _anaconda_lib_bin = os.path.join(os.path.dirname(sys.executable), "..", "Library", "bin")
+for _candidate in [_anaconda_lib_bin,
+                   os.path.expanduser("~/anaconda3/Library/bin"),
+                   os.path.expandvars(r"%LOCALAPPDATA%\anaconda3\Library\bin")]:
+    _candidate = os.path.normpath(_candidate)
+    if os.path.isdir(_candidate) and _candidate not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = _candidate + os.pathsep + os.environ.get("PATH", "")
+        break
 from rasterio.merge import merge
 from rasterio.mask import mask as rasterio_mask
 from rasterio.features import rasterize
@@ -316,6 +329,261 @@ def download_srtm_via_elevation_api(country_gdf, country_slug, country_dir):
     return merged_file
 
 
+def needs_copernicus(country_gdf):
+    """Return True when the country extends beyond SRTM latitude range (~60N / ~56S)."""
+    bounds = country_gdf.to_crs("EPSG:4326").total_bounds  # minx, miny, maxx, maxy
+    return bounds[3] > 60.0 or bounds[1] < -56.0
+
+
+def download_copernicus_dem(country_gdf, country_slug, country_dir, resolution=90):
+    """
+    Download Copernicus GLO DEM tiles from AWS Open Data.
+    resolution: 30 (~30m, GLO-30) or 90 (~90m, GLO-90, default).
+    Global land coverage – no latitude limitation.
+    """
+    import math
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    merged_file = os.path.join(country_dir, f"{country_slug}_srtm.tif")
+    if os.path.exists(merged_file):
+        print("DEM data already exists.")
+        return merged_file
+
+    country_4326 = country_gdf.to_crs("EPSG:4326")
+    try:
+        country_geom = country_4326.geometry.union_all()
+    except AttributeError:
+        country_geom = country_4326.geometry.unary_union
+    minx, miny, maxx, maxy = country_geom.bounds
+
+    lat_min = math.floor(miny)
+    lat_max = math.floor(maxy)
+    lon_min = math.floor(minx)
+    lon_max = math.floor(maxx)
+
+    if resolution == 30:
+        bucket = "copernicus-dem-30m"
+        cog_tag = "COG_10"
+    else:
+        bucket = "copernicus-dem-90m"
+        cog_tag = "COG_30"
+
+    tiles_dir = os.path.join(country_dir, "copernicus_tiles")
+    os.makedirs(tiles_dir, exist_ok=True)
+
+    prepared = shapely_prep(country_geom)
+    tile_specs = []
+    for lat in range(lat_min, lat_max + 1):
+        for lon in range(lon_min, lon_max + 1):
+            tile_poly = shapely_box(lon, lat, lon + 1, lat + 1)
+            if prepared.intersects(tile_poly):
+                ns = "N" if lat >= 0 else "S"
+                ew = "E" if lon >= 0 else "W"
+                lat_abs = abs(lat)
+                lon_abs = abs(lon)
+                tile_name = f"Copernicus_DSM_{cog_tag}_{ns}{lat_abs:02d}_00_{ew}{lon_abs:03d}_00_DEM"
+                url = f"https://{bucket}.s3.eu-central-1.amazonaws.com/{tile_name}/{tile_name}.tif"
+                tif_file = os.path.join(tiles_dir, f"{tile_name}.tif")
+                tile_specs.append((tile_name, url, tif_file))
+
+    print(f"Copernicus DEM ({resolution}m) tiles to download: {len(tile_specs)}")
+
+    def _download_tile(spec):
+        name, url, path = spec
+        if os.path.exists(path):
+            return path, True, name
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            resp = urllib.request.urlopen(req, timeout=120)
+            with open(path, "wb") as f:
+                f.write(resp.read())
+            return path, True, name
+        except Exception:
+            return name, False, name
+
+    tif_files = []
+    failed = 0
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(_download_tile, s): s for s in tile_specs}
+        done_count = 0
+        for future in as_completed(futures):
+            done_count += 1
+            result, success, name = future.result()
+            if success:
+                tif_files.append(result)
+            else:
+                failed += 1
+            if done_count % 20 == 0 or done_count == len(tile_specs):
+                print(f"  Progress: {done_count}/{len(tile_specs)} tiles ({failed} skipped)")
+
+    if not tif_files:
+        raise RuntimeError("No Copernicus DEM tiles downloaded!")
+
+    print(f"  Downloaded: {len(tif_files)}, skipped (ocean/no data): {failed}")
+    print("Merging Copernicus DEM tiles...")
+    datasets = [rasterio.open(f) for f in sorted(tif_files)]
+    merged_data, merged_transform = merge(datasets)
+
+    profile = datasets[0].profile.copy()
+    profile.update({
+        "height": merged_data.shape[1],
+        "width": merged_data.shape[2],
+        "transform": merged_transform,
+        "driver": "GTiff",
+        "compress": "lzw",
+    })
+
+    with rasterio.open(merged_file, "w", **profile) as dst:
+        dst.write(merged_data)
+
+    for ds in datasets:
+        ds.close()
+
+    print(f"Merged Copernicus DEM saved to {merged_file}")
+    return merged_file
+
+
+def download_etopo_dem(country_gdf, country_slug, country_dir):
+    """
+    Download ETOPO 2022 15-arc-second surface elevation tiles from NOAA.
+    Only downloads tiles that overlap with the country bounding box.
+    Resolution: ~450 m.  Global coverage (land + bathymetry).
+    """
+    import shutil
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    merged_file = os.path.join(country_dir, f"{country_slug}_etopo.tif")
+    if os.path.exists(merged_file):
+        print("ETOPO data already exists.")
+        return merged_file
+
+    ETOPO_URL = (
+        "https://www.ngdc.noaa.gov/mgg/global/relief/ETOPO2022/data/15s/"
+        "15s_surface_elev_gtif/"
+    )
+    TILE_STEP = 30  # degrees per tile
+
+    # Country bounds
+    country_4326 = country_gdf.to_crs("EPSG:4326")
+    try:
+        geom = country_4326.geometry.union_all()
+    except AttributeError:
+        geom = country_4326.geometry.unary_union
+    minx, miny, maxx, maxy = geom.bounds
+
+    # List tiles on NOAA server
+    print("Listing ETOPO 2022 tiles on NOAA server...")
+    html = urllib.request.urlopen(ETOPO_URL, timeout=60).read().decode("utf-8", "ignore")
+    all_tiles = sorted(set(re.findall(r'href=["\']([^"\']*\.tif)["\']', html, re.IGNORECASE)))
+    if not all_tiles:
+        raise RuntimeError("No ETOPO tiles found on NOAA server.")
+    print(f"  Found {len(all_tiles)} tiles total on server.")
+
+    # Parse tile coordinates and filter for country overlap.
+    # Tile naming: ETOPO_2022_v1_15s_N90W180_surface.tif
+    # The coordinate is the NW corner; each tile covers TILE_STEP degrees.
+    needed = []
+    for name in all_tiles:
+        m = re.search(r'([NS])(\d+)([EW])(\d+)', name)
+        if not m:
+            continue
+        lat = int(m.group(2))
+        if m.group(1) == 'S':
+            lat = -lat
+        lon = int(m.group(4))
+        if m.group(3) == 'W':
+            lon = -lon
+        tile_n = lat
+        tile_s = lat - TILE_STEP
+        tile_w = lon
+        tile_e = lon + TILE_STEP
+        if (tile_e > minx - 0.5 and tile_w < maxx + 0.5 and
+                tile_n > miny - 0.5 and tile_s < maxy + 0.5):
+            needed.append(name)
+
+    if not needed:
+        raise RuntimeError(f"No ETOPO tiles found covering {country_slug}!")
+    print(f"  ETOPO tiles needed for {country_slug}: {len(needed)}")
+
+    # Download tiles
+    tiles_dir = os.path.join(country_dir, "etopo_tiles")
+    os.makedirs(tiles_dir, exist_ok=True)
+
+    def _download_one(name):
+        dest = os.path.join(tiles_dir, name)
+        if os.path.exists(dest):
+            return dest, True
+        url = f"{ETOPO_URL}{name}"
+        for attempt in range(3):
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                resp = urllib.request.urlopen(req, timeout=180)
+                with open(dest, "wb") as f:
+                    shutil.copyfileobj(resp, f, length=1024 * 1024)
+                return dest, True
+            except Exception as e:
+                if os.path.exists(dest):
+                    try:
+                        os.remove(dest)
+                    except Exception:
+                        pass
+                if attempt >= 2:
+                    print(f"  FAILED: {name}: {e}")
+                    return name, False
+                _time.sleep(2 * (attempt + 1))
+
+    tif_files = []
+    failed = 0
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(_download_one, n): n for n in needed}
+        done_count = 0
+        for future in as_completed(futures):
+            done_count += 1
+            result, success = future.result()
+            if success:
+                tif_files.append(result)
+            else:
+                failed += 1
+            if done_count % 5 == 0 or done_count == len(needed):
+                print(f"  Downloaded: {done_count}/{len(needed)} tiles")
+
+    if not tif_files:
+        raise RuntimeError("No ETOPO tiles downloaded!")
+    if failed:
+        print(f"  Warning: {failed} tile(s) failed to download.")
+
+    # Merge tiles (or copy if only one)
+    if len(tif_files) == 1:
+        shutil.copy2(tif_files[0], merged_file)
+    else:
+        print("Merging ETOPO tiles...")
+        datasets = [rasterio.open(f) for f in sorted(tif_files)]
+        src_nodata = datasets[0].nodata
+        if src_nodata is None:
+            src_nodata = -99999
+        merged_data, merged_transform = merge(datasets, nodata=src_nodata)
+
+        profile = datasets[0].profile.copy()
+        profile.update({
+            "height": merged_data.shape[1],
+            "width": merged_data.shape[2],
+            "transform": merged_transform,
+            "driver": "GTiff",
+            "compress": "lzw",
+            "nodata": src_nodata,
+        })
+
+        with rasterio.open(merged_file, "w", **profile) as dst:
+            dst.write(merged_data)
+
+        for ds in datasets:
+            ds.close()
+
+    print(f"ETOPO DEM saved: {merged_file}")
+    return merged_file
+
+
 def clip_dem_to_country(dem_path, country_gdf, country_slug, country_dir):
     """Clip DEM to country boundary."""
     clipped_file = os.path.join(country_dir, f"{country_slug}_dem_clipped.tif")
@@ -488,7 +756,7 @@ def build_water_raster(dem_path, water_tag, output_dir):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Download SRTM and clip to a country boundary.")
+    parser = argparse.ArgumentParser(description="Download elevation data (ETOPO / Copernicus) and clip to a country boundary.")
     parser.add_argument("country", nargs="?",
                         help="Country name from Natural Earth (e.g. France).")
     parser.add_argument("--country", dest="country_opt", default=None,
@@ -521,8 +789,12 @@ if __name__ == "__main__":
     country = download_country_boundary(country_name, country_slug, country_dir, mainland=args.mainland)
     print(f"{country_name} bounds: {country.total_bounds}\n")
 
-    # Step 2: SRTM elevation data
-    dem_path = download_srtm_via_elevation_api(country, country_slug, country_dir)
+    # Step 2: Elevation data (ETOPO by default, Copernicus for high latitudes)
+    if needs_copernicus(country):
+        print("Country extends beyond 60\u00b0N/56\u00b0S \u2013 using Copernicus DEM (GLO-90).\n")
+        dem_path = download_copernicus_dem(country, country_slug, country_dir)
+    else:
+        dem_path = download_etopo_dem(country, country_slug, country_dir)
 
     # Step 3: Clip to country
     clipped_path = clip_dem_to_country(dem_path, country, country_slug, country_dir)
