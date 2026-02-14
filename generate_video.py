@@ -8,8 +8,10 @@ import os
 import sys
 import time
 import re
+import json
 import argparse
 import urllib.request
+import urllib.parse
 import numpy as np
 import rasterio
 from rasterio.features import rasterize
@@ -26,24 +28,10 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(SCRIPT_DIR, "data")
 DEFAULT_COUNTRY = "Germany"
 
-# Ensure SSL DLLs are findable (Anaconda-based venvs may need this)
-_anaconda_lib_bin = os.path.join(sys.prefix, "..", "Library", "bin")
-if not os.path.isdir(_anaconda_lib_bin):
-    _anaconda_lib_bin = os.path.join(os.path.dirname(sys.executable), "..", "Library", "bin")
-# Also try the base Anaconda installation
-for _candidate in [_anaconda_lib_bin,
-                   os.path.expanduser("~/anaconda3/Library/bin"),
-                   os.path.expandvars(r"%LOCALAPPDATA%\anaconda3\Library\bin")]:
-    _candidate = os.path.normpath(_candidate)
-    if os.path.isdir(_candidate) and _candidate not in os.environ.get("PATH", ""):
-        os.environ["PATH"] = _candidate + os.pathsep + os.environ.get("PATH", "")
-        break
-
 # Video settings
-WIDTH = 1920
-HEIGHT = 1080
+WIDTH = 3840
+HEIGHT = 2160
 FPS = 60
-DEFAULT_DURATION = 90  # seconds of sea-level rise
 RESIZED_MAX_SCALE = 2.0  # default: pick resized DEM up to 2x video size
 
 # UI scale relative to 1080p baseline
@@ -60,9 +48,9 @@ HOLD_START_SEC = 1.0     # hold at sea_min after fade-in
 HOLD_END_SEC = 5.0       # hold at sea_max before fade-out
 
 # Color scheme
-OCEAN_COLOR_DEEP = [60, 110, 185]
-OCEAN_COLOR_SHORE = [120, 180, 235]
-RIVER_COLOR = [60, 110, 185]
+OCEAN_COLOR_DEEP = [40, 80, 160]
+OCEAN_COLOR_SHORE = [100, 160, 220]
+RIVER_COLOR = [40, 80, 160]
 LAKE_SHORE_PX = 20          # rim width in pixels (at SRTM 90m ref resolution)
 
 # Terrain colormap
@@ -327,27 +315,6 @@ def draw_text_on_frame(frame_img, sea_level, fonts, sea_min, sea_max, ui_tick_st
     draw.text((x, y + int(80 * s)), label, font=font_small, fill=(220, 220, 220))
 
 
-# Hand-picked cities for countries where population-based selection
-# clusters too much in one region. These are chosen for good geographic spread.
-PREFERRED_CITIES = {
-    "sweden": [
-        "Stockholm", "Göteborg", "Malmö", "Uppsala",
-        "Umeå", "Luleå", "Sundsvall", "Östersund",
-        "Kiruna", "Gävle",
-    ],
-    "finland": [
-        "Helsinki", "Tampere", "Turku", "Oulu",
-        "Jyväskylä", "Kuopio", "Rovaniemi", "Vaasa",
-        "Joensuu", "Sodankylä",
-    ],
-    "norway": [
-        "Oslo", "Bergen", "Trondheim", "Stavanger",
-        "Tromsø", "Bodø", "Kristiansand", "Ålesund",
-        "Hammerfest", "Drammen",
-    ],
-}
-
-
 def load_cities(country_name, dem_path, num_cities=10):
     """Load top N cities for a country from Natural Earth populated places.
     Returns list of dicts with name, lon, lat, population, elevation (from DEM)."""
@@ -391,26 +358,7 @@ def load_cities(country_name, dem_path, num_cities=10):
             break
     if pop_col:
         matched = matched.sort_values(pop_col, ascending=False)
-    # Use preferred city list if available (for better geographic distribution)
-    preferred = PREFERRED_CITIES.get(name_lower, [])
-    if preferred:
-        preferred_lower = [n.lower() for n in preferred[:num_cities]]
-        name_col = "NAME" if "NAME" in matched.columns else ("NAME_EN" if "NAME_EN" in matched.columns else None)
-        if name_col:
-            chosen = []
-            for pname in preferred_lower:
-                hit = matched[matched[name_col].fillna("").astype(str).str.lower() == pname]
-                if not hit.empty:
-                    chosen.append(hit.iloc[0])
-            if chosen:
-                import pandas as _pd
-                cities = gpd.GeoDataFrame(chosen, crs=matched.crs)
-            else:
-                cities = matched.head(num_cities)
-        else:
-            cities = matched.head(num_cities)
-    else:
-        cities = matched.head(num_cities)
+    cities = matched.head(num_cities)
     # Get elevation from DEM for each city
     result = []
     with rasterio.open(dem_path) as src:
@@ -450,30 +398,45 @@ def project_cities_to_frame(cities, dem_path, new_w, new_h, off_x, off_y):
     return cities
 
 
-def resolve_city_label_positions(cities, font_city):
-    """Pre-compute non-overlapping label positions for all cities."""
-    if not cities or font_city is None:
+def resolve_all_label_positions(cities, mountains, font_city, font_mt):
+    """Pre-compute non-overlapping label positions for ALL cities and mountains
+    in a single unified pass.  This guarantees that:
+      - No label overlaps any city dot or mountain triangle marker.
+      - No label overlaps any other label (city or mountain).
+      - City dots don't overlap mountain markers (they are at fixed geo positions,
+        but the algorithm still considers their bounding boxes).
+    Labels are placed in priority order: cities first (by population / list order),
+    then mountains (by elevation / list order)."""
+    if not cities and not mountains:
         return
     s = UI_SCALE
     pad = int(3 * s)
     offset = int(8 * s)
 
-    placed_boxes = []  # (x1, y1, x2, y2) of already-placed labels + dots
+    placed_boxes = []  # (x1, y1, x2, y2) of reserved areas
 
-    # Reserve space for ALL city dots first so labels avoid them
+    # --- Phase 1: Reserve ALL fixed markers (city dots + mountain triangles) ---
     dot_r = max(2, int(4 * s)) + pad
-    for city in cities:
-        fx, fy = city["frame_x"], city["frame_y"]
-        placed_boxes.append((fx - dot_r, fy - dot_r, fx + dot_r, fy + dot_r))
+    if cities:
+        for city in cities:
+            fx, fy = city["frame_x"], city["frame_y"]
+            placed_boxes.append((fx - dot_r, fy - dot_r, fx + dot_r, fy + dot_r))
 
-    for city in cities:
-        fx, fy = city["frame_x"], city["frame_y"]
-        name = city["name"]
-        bbox = font_city.getbbox(name)
+    tri_half = max(3, int(5 * s))
+    if mountains:
+        for mt in mountains:
+            fx, fy = mt["frame_x"], mt["frame_y"]
+            placed_boxes.append((fx - tri_half - pad, fy - tri_half - pad,
+                                 fx + tri_half + pad, fy + tri_half + pad))
+
+    # --- Phase 2: Place labels, cities first, then mountains ---
+    def _place_label(fx, fy, text, font):
+        """Find the best non-overlapping position for *text* near (fx, fy)."""
+        nonlocal placed_boxes
+        bbox = font.getbbox(text)
         tw = bbox[2] - bbox[0]
         th = bbox[3] - bbox[1]
 
-        # 8 candidate offsets (dx, dy) relative to dot
         candidates = [
             ( offset,             -th // 2),            # right
             (-offset - tw,        -th // 2),            # left
@@ -491,34 +454,51 @@ def resolve_city_label_positions(cities, font_city):
 
         for dx, dy in candidates:
             tx, ty = fx + dx, fy + dy
-            box = (tx - pad, ty - pad, tx + tw + pad, ty + th + pad)
-            # Prefer positions inside the frame
-            if box[0] < 0 or box[1] < 0 or box[2] > WIDTH or box[3] > HEIGHT:
+            cand_box = (tx - pad, ty - pad, tx + tw + pad, ty + th + pad)
+            # Skip candidates that fall outside the frame
+            if cand_box[0] < 0 or cand_box[1] < 0 or cand_box[2] > WIDTH or cand_box[3] > HEIGHT:
                 continue
             overlap = 0
             for pb in placed_boxes:
-                ix1 = max(box[0], pb[0])
-                iy1 = max(box[1], pb[1])
-                ix2 = min(box[2], pb[2])
-                iy2 = min(box[3], pb[3])
+                ix1 = max(cand_box[0], pb[0])
+                iy1 = max(cand_box[1], pb[1])
+                ix2 = min(cand_box[2], pb[2])
+                iy2 = min(cand_box[3], pb[3])
                 if ix1 < ix2 and iy1 < iy2:
                     overlap += (ix2 - ix1) * (iy2 - iy1)
             if overlap < best_overlap:
                 best_overlap = overlap
                 best_pos = (tx, ty)
-                best_box = box
+                best_box = cand_box
                 if overlap == 0:
                     break
 
         if best_pos is None:
-            # All candidates were outside the frame; fall back to right
+            # All candidates outside frame; fallback to right
             tx, ty = fx + offset, fy - th // 2
             best_pos = (tx, ty)
             best_box = (tx - pad, ty - pad, tx + tw + pad, ty + th + pad)
 
-        city["label_x"] = best_pos[0]
-        city["label_y"] = best_pos[1]
         placed_boxes.append(best_box)
+        return best_pos
+
+    # Place city labels
+    if cities and font_city:
+        for city in cities:
+            pos = _place_label(city["frame_x"], city["frame_y"],
+                               city["name"], font_city)
+            city["label_x"] = pos[0]
+            city["label_y"] = pos[1]
+
+    # Place mountain labels
+    if mountains and font_mt:
+        for mt in mountains:
+            display = f"{mt['name']} ({mt['catalog_elev']}m)"
+            mt["display_name"] = display
+            pos = _place_label(mt["frame_x"], mt["frame_y"],
+                               display, font_mt)
+            mt["label_x"] = pos[0]
+            mt["label_y"] = pos[1]
 
 
 def draw_cities_on_frame(draw, cities, sea_level, font_city):
@@ -597,62 +577,235 @@ FAMOUS_MOUNTAINS = {
         {"name": "Vesuvio",       "lat": 40.8213, "lon": 14.4260, "elev": 1281},
     ],
     "france": [
-        {"name": "Mont Blanc",    "lat": 45.8326, "lon": 6.8652,  "elev": 4808},
-        {"name": "Barre des Écrins", "lat": 44.9225, "lon": 6.3578, "elev": 4102},
-        {"name": "Mont Ventoux",  "lat": 44.1742, "lon": 5.2789,  "elev": 1912},
-        {"name": "Puy de Sancy",  "lat": 45.5311, "lon": 2.8142,  "elev": 1886},
-    ],
-    "india": [
-        {"name": "Kangchenjunga", "lat": 27.7025, "lon": 88.1475, "elev": 8586},
-        {"name": "Nanda Devi",    "lat": 30.3733, "lon": 79.9742, "elev": 7816},
-        {"name": "Kamet",         "lat": 30.9208, "lon": 79.5928, "elev": 7756},
-        {"name": "Saser Kangri",  "lat": 34.8000, "lon": 77.7500, "elev": 7672},
-        {"name": "Mamostong Kangri","lat": 34.9167,"lon": 77.5833, "elev": 7516},
-        {"name": "Trisul",        "lat": 30.3100, "lon": 79.7300, "elev": 7120},
-        {"name": "Anamudi",       "lat": 10.1667, "lon": 77.0597, "elev": 2695},
-        {"name": "Dodda Betta",   "lat": 11.4000, "lon": 76.7333, "elev": 2637},
-    ],
-    "south korea": [
-        {"name": "Hallasan",      "lat": 33.3617, "lon": 126.5333, "elev": 1950},
-        {"name": "Jirisan",       "lat": 35.3369, "lon": 127.7306, "elev": 1915},
-        {"name": "Seoraksan",     "lat": 38.1192, "lon": 128.4656, "elev": 1708},
-        {"name": "Taebaeksan",    "lat": 37.0936, "lon": 128.9156, "elev": 1567},
-        {"name": "Deogyusan",     "lat": 35.8631, "lon": 127.7472, "elev": 1614},
-        {"name": "Gayasan",       "lat": 35.8019, "lon": 128.1194, "elev": 1430},
-        {"name": "Odaesan",       "lat": 37.7983, "lon": 128.5428, "elev": 1563},
-    ],
-    "sweden": [
-        {"name": "Kebnekaise",    "lat": 67.9035, "lon": 18.5468, "elev": 2097},
-        {"name": "Sarektjåkkå",   "lat": 67.3967, "lon": 17.7253, "elev": 2089},
-        {"name": "Kaskasatjåkka", "lat": 67.8900, "lon": 18.5800, "elev": 2076},
-        {"name": "Stortoppen",    "lat": 63.1536, "lon": 12.3697, "elev": 1762},
-        {"name": "Storsylen",     "lat": 63.0600, "lon": 12.2256, "elev": 1762},
-    ],
-    "finland": [
-        {"name": "Halti",         "lat": 69.2553, "lon": 25.7403, "elev": 1324},
-        {"name": "Ridnitsohkka",  "lat": 69.1056, "lon": 20.8617, "elev": 1317},
-        {"name": "Kovddoskaisi",  "lat": 69.2000, "lon": 25.6333, "elev": 1243},
-        {"name": "Saana",         "lat": 69.0428, "lon": 20.8431, "elev": 1029},
-        {"name": "Pallastunturi", "lat": 68.0667, "lon": 24.0667, "elev": 807},
-    ],
-    "norway": [
-        {"name": "Galdhøpiggen",  "lat": 61.6364, "lon": 8.3125,  "elev": 2469},
-        {"name": "Glittertind",   "lat": 61.6533, "lon": 8.3856,  "elev": 2452},
-        {"name": "Store Skagastølstind", "lat": 61.5172, "lon": 7.8142, "elev": 2405},
-        {"name": "Styggedalstind", "lat": 61.5253, "lon": 7.8036, "elev": 2387},
-        {"name": "Stetind",       "lat": 68.1483, "lon": 16.5983, "elev": 1392},
+        {"name": "Mont Blanc",       "lat": 45.8326, "lon": 6.8652,  "elev": 4808},
+        {"name": "Barre des Écrins", "lat": 44.9225, "lon": 6.3578,  "elev": 4102},
+        {"name": "Vignemale",        "lat": 42.7733, "lon": -0.1464, "elev": 3298},
+        {"name": "Mont Ventoux",     "lat": 44.1742, "lon": 5.2789,  "elev": 1912},
+        {"name": "Puy de Sancy",     "lat": 45.5311, "lon": 2.8142,  "elev": 1886},
     ],
 }
 
 
-def load_mountains(country_name, dem_path, num_mountains=5):
-    """Load famous mountains for a country. Uses built-in database,
-    filtered to those within the DEM bounding box."""
-    key = country_name.strip().lower()
-    candidates = FAMOUS_MOUNTAINS.get(key, [])
-    if not candidates:
-        print(f"  Warning: No mountains defined for '{country_name}'.")
+def download_mountains_natural_earth(dem_path, country_slug):
+    """Download mountain peaks from Natural Earth elevation points dataset.
+    Same data source as cities, rivers, and lakes in this project.
+    Filters peaks to those within the actual country boundary (not just DEM bbox).
+    Returns list of dicts with name, lat, lon, elev."""
+    # Download Natural Earth elevation points (same pattern as populated places)
+    elev_file = os.path.join(DATA_DIR, "ne_10m_geography_regions_elevation_points.zip")
+    url = "https://naciscdn.org/naturalearth/10m/physical/ne_10m_geography_regions_elevation_points.zip"
+    if not os.path.exists(elev_file):
+        print(f"  Downloading Natural Earth elevation points...")
+        try:
+            urllib.request.urlretrieve(url, elev_file)
+        except Exception:
+            import platform
+            if platform.system() == "Windows":
+                subprocess.run(
+                    ["powershell", "-Command",
+                     f"Invoke-WebRequest -Uri '{url}' -OutFile '{elev_file}'"],
+                    check=True, capture_output=True
+                )
+            else:
+                raise
+
+    points = gpd.read_file(f"zip://{elev_file}")
+    points = points.to_crs("EPSG:4326")
+
+    # Load country boundary for precise filtering (same file used by the rest of the project)
+    boundary_file = os.path.join(DATA_DIR, country_slug, f"{country_slug}_boundary.gpkg")
+    if os.path.exists(boundary_file):
+        print(f"  Filtering peaks to country boundary...")
+        country_gdf = gpd.read_file(boundary_file).to_crs("EPSG:4326")
+        # Spatial join: only keep points inside the country polygon
+        local_points = gpd.sjoin(points, country_gdf, how="inner", predicate="within")
+    else:
+        # Fallback: use DEM bounding box if no boundary file exists
+        print(f"  Warning: No boundary file found, using DEM bounding box as fallback.")
+        with rasterio.open(dem_path) as src:
+            bounds = src.bounds
+        buf = 0.1
+        bbox_mask = (
+            (points.geometry.x >= bounds.left - buf) &
+            (points.geometry.x <= bounds.right + buf) &
+            (points.geometry.y >= bounds.bottom - buf) &
+            (points.geometry.y <= bounds.top + buf)
+        )
+        local_points = points[bbox_mask].copy()
+
+    if local_points.empty:
         return []
+
+    # Extract elevation — try multiple column names
+    elev_col = None
+    for col in ["elevation", "ELEVATION", "elev", "ELEV"]:
+        if col in local_points.columns:
+            elev_col = col
+            break
+
+    if elev_col is None:
+        print(f"  Warning: No elevation column found in Natural Earth dataset.")
+        return []
+
+    # Build results
+    result = []
+    for _, row in local_points.iterrows():
+        name = None
+        for col in ["name", "NAME", "name_en", "NAME_EN"]:
+            if col in row.index and row[col] and str(row[col]).strip():
+                name = str(row[col]).strip()
+                break
+        if not name:
+            continue
+
+        try:
+            elev = float(row[elev_col])
+        except (ValueError, TypeError):
+            continue
+
+        if elev < 100:  # skip very low features
+            continue
+
+        lon, lat = row.geometry.x, row.geometry.y
+        result.append({
+            "name": name,
+            "lat": lat,
+            "lon": lon,
+            "elev": int(round(elev)),
+        })
+
+    # Sort by elevation descending, deduplicate by name
+    result.sort(key=lambda p: p["elev"], reverse=True)
+    seen = set()
+    unique = []
+    for p in result:
+        if p["name"] not in seen:
+            seen.add(p["name"])
+            unique.append(p)
+
+    return unique
+
+
+def download_mountains_overpass(country_slug, country_name, num_peaks=30):
+    """Download mountain peaks from OpenStreetMap via Overpass API.
+    Uses the country boundary to filter peaks precisely.
+    Results are cached as JSON in the country data directory.
+    Returns list of dicts with name, lat, lon, elev."""
+    cache_dir = os.path.join(DATA_DIR, country_slug)
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_file = os.path.join(cache_dir, f"{country_slug}_peaks_osm.json")
+
+    # Return cached results if available
+    if os.path.exists(cache_file):
+        with open(cache_file, "r", encoding="utf-8") as f:
+            cached = json.load(f)
+        print(f"  Loaded {len(cached)} OSM peaks from cache.")
+        return cached
+
+    # Load country boundary for bbox
+    boundary_file = os.path.join(DATA_DIR, country_slug, f"{country_slug}_boundary.gpkg")
+    if os.path.exists(boundary_file):
+        country_gdf = gpd.read_file(boundary_file).to_crs("EPSG:4326")
+        try:
+            country_geom = country_gdf.geometry.union_all()
+        except AttributeError:
+            country_geom = country_gdf.geometry.unary_union
+        minx, miny, maxx, maxy = country_geom.bounds
+    else:
+        print(f"  Warning: No boundary file for Overpass query.")
+        return []
+
+    # Query Overpass API for peaks with name and elevation within bbox
+    bbox = f"{miny},{minx},{maxy},{maxx}"
+    query = f'[out:json][timeout:60];node["natural"="peak"]["name"]["ele"]({bbox});out body;'
+    overpass_url = "https://overpass-api.de/api/interpreter"
+
+    print(f"  Querying Overpass API for peaks in {country_name}...")
+    try:
+        data = urllib.parse.urlencode({"data": query}).encode("utf-8")
+        req = urllib.request.Request(overpass_url, data=data,
+                                     headers={"User-Agent": "RisingSeaLevel/1.0"})
+        response = urllib.request.urlopen(req, timeout=60)
+        result = json.loads(response.read().decode("utf-8"))
+    except Exception as e:
+        print(f"  Warning: Overpass API query failed: {e}")
+        return []
+
+    # Parse results and filter to those inside the country boundary
+    from shapely.geometry import Point
+    from shapely.prepared import prep as shapely_prep
+    prepared_geom = shapely_prep(country_geom)
+
+    peaks = []
+    for element in result.get("elements", []):
+        tags = element.get("tags", {})
+        name = tags.get("name", tags.get("name:en", ""))
+        ele_str = tags.get("ele", "")
+        if not name or not ele_str:
+            continue
+        try:
+            ele = float(re.sub(r"[^0-9.\-]", "", ele_str))
+        except (ValueError, TypeError):
+            continue
+        if ele < 100:
+            continue
+        lat, lon = element["lat"], element["lon"]
+        # Filter: must be inside country boundary
+        if not prepared_geom.contains(Point(lon, lat)):
+            continue
+        peaks.append({
+            "name": name,
+            "lat": lat,
+            "lon": lon,
+            "elev": int(round(ele)),
+        })
+
+    # Sort by elevation descending, deduplicate by name
+    peaks.sort(key=lambda p: p["elev"], reverse=True)
+    seen = set()
+    unique = []
+    for p in peaks:
+        if p["name"] not in seen:
+            seen.add(p["name"])
+            unique.append(p)
+    peaks = unique[:max(num_peaks, 30)]
+
+    # Cache results
+    with open(cache_file, "w", encoding="utf-8") as f:
+        json.dump(peaks, f, ensure_ascii=False, indent=2)
+    print(f"  Downloaded {len(peaks)} peaks from OpenStreetMap, cached to {cache_file}")
+    return peaks
+
+
+def load_mountains(country_name, dem_path, num_mountains=5, country_slug=None):
+    """Load famous mountains for a country.
+    Priority: 1) hardcoded FAMOUS_MOUNTAINS, 2) Natural Earth, 3) Overpass API (OSM).
+    Always ensures enough peaks are returned if data is available."""
+    key = country_name.strip().lower()
+    if country_slug is None:
+        country_slug = slugify(country_name)
+    candidates = FAMOUS_MOUNTAINS.get(key, None)
+
+    if candidates is None:
+        # Try Natural Earth first (consistent with the rest of the project)
+        print(f"  No hardcoded mountains for '{country_name}', trying Natural Earth...")
+        candidates = download_mountains_natural_earth(dem_path, country_slug)
+        # If Natural Earth doesn't have enough, supplement with Overpass API (OSM)
+        if len(candidates) < num_mountains:
+            ne_count = len(candidates)
+            print(f"  Natural Earth has only {ne_count} peaks, querying OpenStreetMap for more...")
+            osm_peaks = download_mountains_overpass(country_slug, country_name, num_peaks=num_mountains * 3)
+            # Merge: NE peaks first, then OSM peaks (deduplicated by name)
+            existing_names = {c["name"].lower() for c in candidates}
+            for p in osm_peaks:
+                if p["name"].lower() not in existing_names:
+                    candidates.append(p)
+                    existing_names.add(p["name"].lower())
+            # Re-sort by elevation
+            candidates.sort(key=lambda p: p["elev"], reverse=True)
+        if not candidates:
+            print(f"  Warning: No mountains found for '{country_name}'.")
+            return []
 
     result = []
     with rasterio.open(dem_path) as src:
@@ -683,7 +836,10 @@ def load_mountains(country_name, dem_path, num_mountains=5):
     # Sort by elevation descending, take top N
     result.sort(key=lambda m: m["elevation"], reverse=True)
     result = result[:num_mountains]
-    print(f"  Loaded {len(result)} mountains: {', '.join(m['name'] + ' (' + str(m['catalog_elev']) + 'm)' for m in result)}")
+    if result:
+        print(f"  Loaded {len(result)} mountains: {', '.join(m['name'] + ' (' + str(m['catalog_elev']) + 'm)' for m in result)}")
+    else:
+        print(f"  Warning: No mountains found within DEM bounds for '{country_name}'.")
     return result
 
 
@@ -699,90 +855,6 @@ def project_mountains_to_frame(mountains, dem_path, new_w, new_h, off_x, off_y):
             mt["frame_x"] = int(px * scale) + off_x
             mt["frame_y"] = int(py * scale) + off_y
     return mountains
-
-
-def resolve_mountain_label_positions(mountains, cities, font_mt):
-    """Pre-compute non-overlapping label positions for mountains,
-    taking existing city markers and labels into account."""
-    if not mountains or font_mt is None:
-        return
-    s = UI_SCALE
-    pad = int(3 * s)
-    offset = int(8 * s)
-    tri_half = max(3, int(5 * s))
-
-    # Start with placed_boxes from cities (dots + labels)
-    placed_boxes = []
-    if cities:
-        dot_r = max(2, int(4 * s)) + pad
-        for city in cities:
-            fx, fy = city["frame_x"], city["frame_y"]
-            placed_boxes.append((fx - dot_r, fy - dot_r, fx + dot_r, fy + dot_r))
-            # Also reserve city label boxes
-            if "label_x" in city and "label_y" in city:
-                lx, ly = city["label_x"], city["label_y"]
-                bbox = font_mt.getbbox(city["name"])
-                tw = bbox[2] - bbox[0]
-                th = bbox[3] - bbox[1]
-                placed_boxes.append((lx - pad, ly - pad, lx + tw + pad, ly + th + pad))
-
-    # Reserve all mountain triangle markers first
-    for mt in mountains:
-        fx, fy = mt["frame_x"], mt["frame_y"]
-        placed_boxes.append((fx - tri_half - pad, fy - tri_half - pad,
-                             fx + tri_half + pad, fy + tri_half + pad))
-
-    for mt in mountains:
-        fx, fy = mt["frame_x"], mt["frame_y"]
-        name = f"{mt['name']} ({mt['catalog_elev']}m)"
-        mt["display_name"] = name
-        bbox = font_mt.getbbox(name)
-        tw = bbox[2] - bbox[0]
-        th = bbox[3] - bbox[1]
-
-        candidates = [
-            ( offset,             -th // 2),
-            (-offset - tw,        -th // 2),
-            (-tw // 2,            -offset - th),
-            (-tw // 2,             offset),
-            ( offset,             -offset - th),
-            ( offset,              offset),
-            (-offset - tw,        -offset - th),
-            (-offset - tw,         offset),
-        ]
-
-        best_pos = None
-        best_overlap = float('inf')
-        best_box = None
-
-        for dx, dy in candidates:
-            tx, ty = fx + dx, fy + dy
-            box = (tx - pad, ty - pad, tx + tw + pad, ty + th + pad)
-            if box[0] < 0 or box[1] < 0 or box[2] > WIDTH or box[3] > HEIGHT:
-                continue
-            overlap = 0
-            for pb in placed_boxes:
-                ix1 = max(box[0], pb[0])
-                iy1 = max(box[1], pb[1])
-                ix2 = min(box[2], pb[2])
-                iy2 = min(box[3], pb[3])
-                if ix1 < ix2 and iy1 < iy2:
-                    overlap += (ix2 - ix1) * (iy2 - iy1)
-            if overlap < best_overlap:
-                best_overlap = overlap
-                best_pos = (tx, ty)
-                best_box = box
-                if overlap == 0:
-                    break
-
-        if best_pos is None:
-            tx, ty = fx + offset, fy - th // 2
-            best_pos = (tx, ty)
-            best_box = (tx - pad, ty - pad, tx + tw + pad, ty + th + pad)
-
-        mt["label_x"] = best_pos[0]
-        mt["label_y"] = best_pos[1]
-        placed_boxes.append(best_box)
 
 
 def draw_mountains_on_frame(draw, mountains, sea_level, font_mt):
@@ -839,9 +911,6 @@ def build_sea_levels(sea_min, sea_max, sea_step, curve):
     if curve == "easein":
         # Gentle acceleration: starts with visible movement, ends 19x faster.
         shaped = 0.1 * t + 0.9 * t ** 2
-    elif curve == "easein2":
-        # Stronger acceleration: very slow start, rapid end (58x ratio).
-        shaped = 0.05 * t + 0.95 * t ** 3
     elif curve == "quadratic":
         shaped = t ** 2
     elif curve == "cubic":
@@ -977,8 +1046,8 @@ def parse_args():
                         help=f"Use Mont Blanc elevation as max sea level ({MONT_BLANC_ELEVATION_M}m).")
     parser.add_argument("--sea-step", type=float, default=SEA_LEVEL_STEP,
                         help=f"Step in meters used to determine frame count (default: {SEA_LEVEL_STEP}).")
-    parser.add_argument("--sea-curve", choices=["linear", "easein", "easein2", "quadratic", "cubic", "log"], default="easein",
-                        help="Sea-level growth curve over time (default: easein). easein2 = stronger acceleration.")
+    parser.add_argument("--sea-curve", choices=["linear", "easein", "quadratic", "cubic", "log"], default="easein",
+                        help="Sea-level growth curve over time (default: easein).")
     parser.add_argument("--ui-tick-step", type=int, default=None,
                         help="Fixed tick step (meters) for the bottom scale. Default: auto.")
     parser.add_argument("--width", type=int, default=None,
@@ -987,12 +1056,12 @@ def parse_args():
                         help="Video height in pixels (default: 2160).")
     parser.add_argument("--fps", type=int, default=None,
                         help="Frames per second (default: 60).")
-    parser.add_argument("--duration", type=float, default=DEFAULT_DURATION,
-                        help=f"Video duration in seconds (default: {DEFAULT_DURATION}). Overrides --sea-step.")
-    parser.add_argument("--cities", type=int, default=10,
-                        help="Show top N cities by population (default: 10).")
-    parser.add_argument("--mountains", type=int, default=5,
-                        help="Show top N famous mountains (default: 5).")
+    parser.add_argument("--duration", type=float, default=None,
+                        help="Video duration in seconds. Overrides --sea-step.")
+    parser.add_argument("--cities", type=int, default=0,
+                        help="Show top N cities by population (e.g. --cities 10). Default: 0 (off).")
+    parser.add_argument("--mountains", type=int, default=0,
+                        help="Show top N famous mountains (e.g. --mountains 5). Default: 0 (off).")
     return parser.parse_args()
 
 
@@ -1052,49 +1121,12 @@ def main():
         if os.path.exists(legacy_dem):
             print(f"Note: using legacy DEM path: {legacy_dem}")
             dem_path = legacy_dem
-    # Auto-download DEM if it still doesn't exist
-    if not args.dem and not os.path.exists(dem_path):
-        print(f"DEM not found for '{country_name}'. Running download_data.py automatically...\n")
-        download_script = os.path.join(SCRIPT_DIR, "download_data.py")
-        if not os.path.exists(download_script):
-            print("ERROR: download_data.py not found.")
-            sys.exit(1)
-        dl_cmd = [sys.executable, download_script, country_name,
-                  "--dem-size", f"{int(WIDTH * RESIZED_MAX_SCALE)}x{int(HEIGHT * RESIZED_MAX_SCALE)}"]
-        print(f"  Command: {' '.join(dl_cmd)}\n")
-        dl_result = subprocess.run(dl_cmd)
-        if dl_result.returncode != 0:
-            print("ERROR: download_data.py failed.")
-            sys.exit(1)
-        # Re-resolve DEM path after download
-        dem_path = default_dem
-        if not args.full_res:
-            resized_dem = find_resized_dem(country_dir, country_slug,
-                                          int(WIDTH * RESIZED_MAX_SCALE),
-                                          int(HEIGHT * RESIZED_MAX_SCALE))
-            if resized_dem:
-                print(f"Note: using resized DEM: {resized_dem}")
-                dem_path = resized_dem
-        if not os.path.exists(dem_path):
-            print(f"ERROR: DEM still not found after download: {dem_path}")
-            sys.exit(1)
-        print()
     dem_tag = country_slug
     if dem_path != default_dem:
         dem_base = os.path.splitext(os.path.basename(dem_path))[0]
         dem_tag = slugify(dem_base.replace("_dem_clipped", ""))
     is_resized_dem = re.search(r"_\d+x\d+_dem_clipped\.tif$", os.path.basename(dem_path)) is not None
     is_etopo_dem = "etopo" in os.path.basename(dem_path).lower()
-    is_copernicus_dem = "copernicus" in os.path.basename(dem_path).lower()
-    # Determine DEM source label for display
-    if is_etopo_dem:
-        dem_source = "ETOPO 2022 (NOAA, ~450m, Public Domain)"
-    elif is_copernicus_dem:
-        dem_source = "Copernicus GLO-90 (ESA/DLR, ~90m, attribution required)"
-    elif "srtm" in os.path.basename(dem_path).lower():
-        dem_source = "SRTM (CGIAR, ~90m, CC-BY 4.0)"
-    else:
-        dem_source = "Unknown"
     if is_etopo_dem:
         # Gentler land boost for coarse ETOPO DEMs (avoid oversaturation)
         globals()["LAND_BRIGHTNESS"] = LAND_BRIGHTNESS_ETOPO
@@ -1114,7 +1146,6 @@ def main():
         mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
         print(f"VRAM: {mem_gb:.1f} GB")
     print(f"DEM: {dem_path}")
-    print(f"DEM source: {dem_source}")
     print(f"Output: {output_video}")
     if preview_path:
         print(f"Preview: {preview_path}")
@@ -1185,7 +1216,7 @@ def main():
     ocean_noise_gpu = torch.from_numpy(noise_np).to(DEVICE, dtype=torch.float32)
 
     # Sea levels — auto-detect from DEM if not explicitly set
-    sea_min = float(args.sea_min) if args.sea_min is not None else 0.0
+    sea_min = float(args.sea_min) if args.sea_min is not None else dem_elev_min
     if args.sea_max_montblanc:
         sea_max = float(MONT_BLANC_ELEVATION_M)
     elif args.sea_max is not None:
@@ -1253,15 +1284,17 @@ def main():
         print(f"Loading top {args.cities} cities...")
         city_data = load_cities(country_name, dem_path, args.cities)
         city_data = project_cities_to_frame(city_data, dem_path, new_w, new_h, off_x, off_y)
-        resolve_city_label_positions(city_data, font_city)
 
     # Load mountains if requested
     mountain_data = []
     if args.mountains > 0:
         print(f"Loading top {args.mountains} mountains...")
-        mountain_data = load_mountains(country_name, dem_path, args.mountains)
+        mountain_data = load_mountains(country_name, dem_path, args.mountains, country_slug=country_slug)
         mountain_data = project_mountains_to_frame(mountain_data, dem_path, new_w, new_h, off_x, off_y)
-        resolve_mountain_label_positions(mountain_data, city_data, font_mt)
+
+    # Resolve ALL label positions in one unified pass (cities + mountains)
+    if city_data or mountain_data:
+        resolve_all_label_positions(city_data, mountain_data, font_city, font_mt)
 
     # Pre-render background frame
     bg_frame = Image.new('RGB', (WIDTH, HEIGHT), tuple(OCEAN_COLOR_DEEP))
@@ -1325,6 +1358,7 @@ def main():
         if mountain_data and font_mt:
             draw = ImageDraw.Draw(frame_img)
             draw_mountains_on_frame(draw, mountain_data, sl, font_mt)
+        preview_path = "frame_0000.png"
         frame_img.save(preview_path)
         print(f"Preview saved to: {preview_path}")
         return
