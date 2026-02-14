@@ -5,6 +5,7 @@ Pipes frames directly to ffmpeg - no PNG files needed.
 """
 
 import os
+import json
 import sys
 import time
 import re
@@ -542,130 +543,46 @@ def draw_cities_on_frame(draw, cities, sea_level, font_city):
         draw.text((tx + shadow, ty + shadow), name, font=font_city, fill=(0, 0, 0))
         draw.text((tx, ty), name, font=font_city, fill=white)
 
+# 1. Funktion zum einmaligen Laden der JSON-Daten beim Programmstart
+def get_all_mountains():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    json_path = os.path.join(script_dir, "mountains.json")
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"  Error loading mountains.json: {e}")
+        return {}
 
-# === Mountain Support ===
-
-FAMOUS_MOUNTAINS = {
-    "austria": [
-        {"name": "Großglockner",  "lat": 47.0742, "lon": 12.6942, "elev": 3798},
-        {"name": "Wildspitze",    "lat": 46.8850, "lon": 10.8672, "elev": 3768},
-        {"name": "Weißkugel",     "lat": 46.8447, "lon": 10.7114, "elev": 3739},
-        {"name": "Großvenediger", "lat": 47.1092, "lon": 12.3444, "elev": 3657},
-        {"name": "Similaun",      "lat": 46.7600, "lon": 10.8817, "elev": 3599},
-        {"name": "Zuckerhütl",    "lat": 46.9917, "lon": 11.1350, "elev": 3507},
-        {"name": "Schrankogel",   "lat": 47.0408, "lon": 11.0892, "elev": 3497},
-        {"name": "Olperer",       "lat": 47.0200, "lon": 11.6767, "elev": 3476},
-        {"name": "Dachstein",     "lat": 47.4753, "lon": 13.6069, "elev": 2995},
-        {"name": "Großer Priel",  "lat": 47.7175, "lon": 14.0628, "elev": 2515},
-    ],
-    "turkey": [
-        {"name": "Ağrı Dağı",    "lat": 39.7019, "lon": 44.2991, "elev": 5137},
-        {"name": "Süphan Dağı",  "lat": 38.9256, "lon": 42.8281, "elev": 4058},
-        {"name": "Kaçkar Dağı",  "lat": 40.8333, "lon": 41.1833, "elev": 3937},
-        {"name": "Erciyes Dağı", "lat": 38.5316, "lon": 35.4526, "elev": 3917},
-        {"name": "Demirkazık",   "lat": 37.8339, "lon": 35.1414, "elev": 3756},
-        {"name": "Uludağ",       "lat": 40.0833, "lon": 29.2167, "elev": 2543},
-        {"name": "Nemrut Dağı",  "lat": 37.9810, "lon": 38.7411, "elev": 2150},
-    ],
-    "spain": [
-        {"name": "Teide",         "lat": 28.2724, "lon": -16.6425, "elev": 3718},
-        {"name": "Mulhacén",      "lat": 37.0534, "lon": -3.3111,  "elev": 3479},
-        {"name": "Aneto",         "lat": 42.6313, "lon": 0.6573,   "elev": 3404},
-        {"name": "Veleta",        "lat": 37.0561, "lon": -3.3667,  "elev": 3396},
-        {"name": "Posets",        "lat": 42.6558, "lon": 0.4311,   "elev": 3375},
-        {"name": "Pico de Almanzor", "lat": 40.2492, "lon": -5.2953, "elev": 2592},
-    ],
-    "germany": [
-        {"name": "Zugspitze",     "lat": 47.4211, "lon": 10.9853, "elev": 2962},
-        {"name": "Watzmann",      "lat": 47.5550, "lon": 12.9211, "elev": 2713},
-        {"name": "Feldberg",      "lat": 47.8742, "lon": 8.0036,  "elev": 1493},
-        {"name": "Großer Arber",  "lat": 49.1125, "lon": 13.1361, "elev": 1456},
-        {"name": "Brocken",       "lat": 51.7986, "lon": 10.6153, "elev": 1141},
-    ],
-    "switzerland": [
-        {"name": "Dufourspitze",  "lat": 45.9369, "lon": 7.8667,  "elev": 4634},
-        {"name": "Dom",           "lat": 46.0908, "lon": 7.8583,  "elev": 4545},
-        {"name": "Matterhorn",    "lat": 45.9764, "lon": 7.6586,  "elev": 4478},
-        {"name": "Jungfrau",      "lat": 46.5367, "lon": 7.9614,  "elev": 4158},
-        {"name": "Eiger",         "lat": 46.5775, "lon": 8.0053,  "elev": 3967},
-    ],
-    "italy": [
-        {"name": "Monte Bianco",  "lat": 45.8326, "lon": 6.8652,  "elev": 4808},
-        {"name": "Monte Rosa",    "lat": 45.9369, "lon": 7.8667,  "elev": 4634},
-        {"name": "Gran Paradiso", "lat": 45.5181, "lon": 7.2661,  "elev": 4061},
-        {"name": "Etna",          "lat": 37.7510, "lon": 14.9934, "elev": 3357},
-        {"name": "Vesuvio",       "lat": 40.8213, "lon": 14.4260, "elev": 1281},
-    ],
-    "france": [
-        {"name": "Mont Blanc",    "lat": 45.8326, "lon": 6.8652,  "elev": 4808},
-        {"name": "Barre des Écrins", "lat": 44.9225, "lon": 6.3578, "elev": 4102},
-        {"name": "Mont Ventoux",  "lat": 44.1742, "lon": 5.2789,  "elev": 1912},
-        {"name": "Puy de Sancy",  "lat": 45.5311, "lon": 2.8142,  "elev": 1886},
-    ],
-    "india": [
-        {"name": "Kangchenjunga", "lat": 27.7025, "lon": 88.1475, "elev": 8586},
-        {"name": "Nanda Devi",    "lat": 30.3733, "lon": 79.9742, "elev": 7816},
-        {"name": "Kamet",         "lat": 30.9208, "lon": 79.5928, "elev": 7756},
-        {"name": "Saser Kangri",  "lat": 34.8000, "lon": 77.7500, "elev": 7672},
-        {"name": "Mamostong Kangri","lat": 34.9167,"lon": 77.5833, "elev": 7516},
-        {"name": "Trisul",        "lat": 30.3100, "lon": 79.7300, "elev": 7120},
-        {"name": "Anamudi",       "lat": 10.1667, "lon": 77.0597, "elev": 2695},
-        {"name": "Dodda Betta",   "lat": 11.4000, "lon": 76.7333, "elev": 2637},
-    ],
-    "south korea": [
-        {"name": "Hallasan",      "lat": 33.3617, "lon": 126.5333, "elev": 1950},
-        {"name": "Jirisan",       "lat": 35.3369, "lon": 127.7306, "elev": 1915},
-        {"name": "Seoraksan",     "lat": 38.1192, "lon": 128.4656, "elev": 1708},
-        {"name": "Taebaeksan",    "lat": 37.0936, "lon": 128.9156, "elev": 1567},
-        {"name": "Deogyusan",     "lat": 35.8631, "lon": 127.7472, "elev": 1614},
-        {"name": "Gayasan",       "lat": 35.8019, "lon": 128.1194, "elev": 1430},
-        {"name": "Odaesan",       "lat": 37.7983, "lon": 128.5428, "elev": 1563},
-    ],
-    "sweden": [
-        {"name": "Kebnekaise",    "lat": 67.9035, "lon": 18.5468, "elev": 2097},
-        {"name": "Sarektjåkkå",   "lat": 67.3967, "lon": 17.7253, "elev": 2089},
-        {"name": "Kaskasatjåkka", "lat": 67.8900, "lon": 18.5800, "elev": 2076},
-        {"name": "Stortoppen",    "lat": 63.1536, "lon": 12.3697, "elev": 1762},
-        {"name": "Storsylen",     "lat": 63.0600, "lon": 12.2256, "elev": 1762},
-    ],
-    "finland": [
-        {"name": "Halti",         "lat": 69.2553, "lon": 25.7403, "elev": 1324},
-        {"name": "Ridnitsohkka",  "lat": 69.1056, "lon": 20.8617, "elev": 1317},
-        {"name": "Kovddoskaisi",  "lat": 69.2000, "lon": 25.6333, "elev": 1243},
-        {"name": "Saana",         "lat": 69.0428, "lon": 20.8431, "elev": 1029},
-        {"name": "Pallastunturi", "lat": 68.0667, "lon": 24.0667, "elev": 807},
-    ],
-    "norway": [
-        {"name": "Galdhøpiggen",  "lat": 61.6364, "lon": 8.3125,  "elev": 2469},
-        {"name": "Glittertind",   "lat": 61.6533, "lon": 8.3856,  "elev": 2452},
-        {"name": "Store Skagastølstind", "lat": 61.5172, "lon": 7.8142, "elev": 2405},
-        {"name": "Styggedalstind", "lat": 61.5253, "lon": 7.8036, "elev": 2387},
-        {"name": "Stetind",       "lat": 68.1483, "lon": 16.5983, "elev": 1392},
-    ],
-}
-
+# Global laden (ersetzt dein altes FAMOUS_MOUNTAINS Dictionary)
+FAMOUS_MOUNTAINS = get_all_mountains()
 
 def load_mountains(country_name, dem_path, num_mountains=5):
-    """Load famous mountains for a country. Uses built-in database,
-    filtered to those within the DEM bounding box."""
-    key = country_name.strip().lower()
-    candidates = FAMOUS_MOUNTAINS.get(key, [])
+    """Load famous mountains for a country from JSON and filter by DEM bounds."""
+    # .strip() entfernt normale Leerzeichen
+    # .replace('\u00a0', '') entfernt das fiese "feste" Leerzeichen
+    search_key = country_name.strip().replace('\u00a0', '').lower()
+    
+    # Wir suchen in der JSON nach dem passenden Key, egal wie er geschrieben ist
+    actual_key = next((k for k in FAMOUS_MOUNTAINS if k.strip().replace('\u00a0', '').lower() == search_key), None)
+    
+    candidates = FAMOUS_MOUNTAINS.get(actual_key, []) if actual_key else []
+    
     if not candidates:
-        print(f"  Warning: No mountains defined for '{country_name}'.")
+        print(f"   Warning: No mountains defined for '{country_name}' in JSON.")
         return []
 
     result = []
     with rasterio.open(dem_path) as src:
-        bounds = src.bounds  # left, bottom, right, top
+        bounds = src.bounds  
         dem_data = src.read(1)
         for mt in candidates:
             lon, lat = mt["lon"], mt["lat"]
-            # Check within DEM bounds (with small buffer)
             buf = 0.01
             if not (bounds.left - buf <= lon <= bounds.right + buf and
                     bounds.bottom - buf <= lat <= bounds.top + buf):
                 continue
-            # Get DEM elevation at peak location
+            
             try:
                 py, px = src.index(lon, lat)
                 if 0 <= py < src.height and 0 <= px < src.width:
@@ -674,13 +591,14 @@ def load_mountains(country_name, dem_path, num_mountains=5):
                     elev = mt["elev"]
             except Exception:
                 elev = mt["elev"]
+
             result.append({
                 "name": mt["name"],
                 "lon": lon, "lat": lat,
                 "elevation": max(elev, mt["elev"]),
                 "catalog_elev": mt["elev"],
             })
-    # Sort by elevation descending, take top N
+
     result.sort(key=lambda m: m["elevation"], reverse=True)
     result = result[:num_mountains]
     print(f"  Loaded {len(result)} mountains: {', '.join(m['name'] + ' (' + str(m['catalog_elev']) + 'm)' for m in result)}")
@@ -977,7 +895,7 @@ def parse_args():
                         help=f"Use Mont Blanc elevation as max sea level ({MONT_BLANC_ELEVATION_M}m).")
     parser.add_argument("--sea-step", type=float, default=SEA_LEVEL_STEP,
                         help=f"Step in meters used to determine frame count (default: {SEA_LEVEL_STEP}).")
-    parser.add_argument("--sea-curve", choices=["linear", "easein", "easein2", "quadratic", "cubic", "log"], default="easein",
+    parser.add_argument("--sea-curve", choices=["linear", "easein", "easein2", "quadratic", "cubic", "log"], default="easein2",
                         help="Sea-level growth curve over time (default: easein). easein2 = stronger acceleration.")
     parser.add_argument("--ui-tick-step", type=int, default=None,
                         help="Fixed tick step (meters) for the bottom scale. Default: auto.")
