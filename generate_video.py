@@ -26,10 +26,24 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(SCRIPT_DIR, "data")
 DEFAULT_COUNTRY = "Germany"
 
+# Ensure SSL DLLs are findable (Anaconda-based venvs may need this)
+_anaconda_lib_bin = os.path.join(sys.prefix, "..", "Library", "bin")
+if not os.path.isdir(_anaconda_lib_bin):
+    _anaconda_lib_bin = os.path.join(os.path.dirname(sys.executable), "..", "Library", "bin")
+# Also try the base Anaconda installation
+for _candidate in [_anaconda_lib_bin,
+                   os.path.expanduser("~/anaconda3/Library/bin"),
+                   os.path.expandvars(r"%LOCALAPPDATA%\anaconda3\Library\bin")]:
+    _candidate = os.path.normpath(_candidate)
+    if os.path.isdir(_candidate) and _candidate not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = _candidate + os.pathsep + os.environ.get("PATH", "")
+        break
+
 # Video settings
-WIDTH = 3840
-HEIGHT = 2160
+WIDTH = 1920
+HEIGHT = 1080
 FPS = 60
+DEFAULT_DURATION = 90  # seconds of sea-level rise
 RESIZED_MAX_SCALE = 2.0  # default: pick resized DEM up to 2x video size
 
 # UI scale relative to 1080p baseline
@@ -548,6 +562,25 @@ FAMOUS_MOUNTAINS = {
         {"name": "Mont Ventoux",  "lat": 44.1742, "lon": 5.2789,  "elev": 1912},
         {"name": "Puy de Sancy",  "lat": 45.5311, "lon": 2.8142,  "elev": 1886},
     ],
+    "india": [
+        {"name": "Kangchenjunga", "lat": 27.7025, "lon": 88.1475, "elev": 8586},
+        {"name": "Nanda Devi",    "lat": 30.3733, "lon": 79.9742, "elev": 7816},
+        {"name": "Kamet",         "lat": 30.9208, "lon": 79.5928, "elev": 7756},
+        {"name": "Saser Kangri",  "lat": 34.8000, "lon": 77.7500, "elev": 7672},
+        {"name": "Mamostong Kangri","lat": 34.9167,"lon": 77.5833, "elev": 7516},
+        {"name": "Trisul",        "lat": 30.3100, "lon": 79.7300, "elev": 7120},
+        {"name": "Anamudi",       "lat": 10.1667, "lon": 77.0597, "elev": 2695},
+        {"name": "Dodda Betta",   "lat": 11.4000, "lon": 76.7333, "elev": 2637},
+    ],
+    "south korea": [
+        {"name": "Hallasan",      "lat": 33.3617, "lon": 126.5333, "elev": 1950},
+        {"name": "Jirisan",       "lat": 35.3369, "lon": 127.7306, "elev": 1915},
+        {"name": "Seoraksan",     "lat": 38.1192, "lon": 128.4656, "elev": 1708},
+        {"name": "Taebaeksan",    "lat": 37.0936, "lon": 128.9156, "elev": 1567},
+        {"name": "Deogyusan",     "lat": 35.8631, "lon": 127.7472, "elev": 1614},
+        {"name": "Gayasan",       "lat": 35.8019, "lon": 128.1194, "elev": 1430},
+        {"name": "Odaesan",       "lat": 37.7983, "lon": 128.5428, "elev": 1563},
+    ],
 }
 
 
@@ -745,6 +778,9 @@ def build_sea_levels(sea_min, sea_max, sea_step, curve):
     if curve == "easein":
         # Gentle acceleration: starts with visible movement, ends 19x faster.
         shaped = 0.1 * t + 0.9 * t ** 2
+    elif curve == "easein2":
+        # Stronger acceleration: very slow start, rapid end (58x ratio).
+        shaped = 0.05 * t + 0.95 * t ** 3
     elif curve == "quadratic":
         shaped = t ** 2
     elif curve == "cubic":
@@ -880,8 +916,8 @@ def parse_args():
                         help=f"Use Mont Blanc elevation as max sea level ({MONT_BLANC_ELEVATION_M}m).")
     parser.add_argument("--sea-step", type=float, default=SEA_LEVEL_STEP,
                         help=f"Step in meters used to determine frame count (default: {SEA_LEVEL_STEP}).")
-    parser.add_argument("--sea-curve", choices=["linear", "easein", "quadratic", "cubic", "log"], default="easein",
-                        help="Sea-level growth curve over time (default: easein).")
+    parser.add_argument("--sea-curve", choices=["linear", "easein", "easein2", "quadratic", "cubic", "log"], default="easein",
+                        help="Sea-level growth curve over time (default: easein). easein2 = stronger acceleration.")
     parser.add_argument("--ui-tick-step", type=int, default=None,
                         help="Fixed tick step (meters) for the bottom scale. Default: auto.")
     parser.add_argument("--width", type=int, default=None,
@@ -890,12 +926,12 @@ def parse_args():
                         help="Video height in pixels (default: 2160).")
     parser.add_argument("--fps", type=int, default=None,
                         help="Frames per second (default: 60).")
-    parser.add_argument("--duration", type=float, default=None,
-                        help="Video duration in seconds. Overrides --sea-step.")
-    parser.add_argument("--cities", type=int, default=0,
-                        help="Show top N cities by population (e.g. --cities 10). Default: 0 (off).")
-    parser.add_argument("--mountains", type=int, default=0,
-                        help="Show top N famous mountains (e.g. --mountains 5). Default: 0 (off).")
+    parser.add_argument("--duration", type=float, default=DEFAULT_DURATION,
+                        help=f"Video duration in seconds (default: {DEFAULT_DURATION}). Overrides --sea-step.")
+    parser.add_argument("--cities", type=int, default=10,
+                        help="Show top N cities by population (default: 10).")
+    parser.add_argument("--mountains", type=int, default=5,
+                        help="Show top N famous mountains (default: 5).")
     return parser.parse_args()
 
 
@@ -955,6 +991,33 @@ def main():
         if os.path.exists(legacy_dem):
             print(f"Note: using legacy DEM path: {legacy_dem}")
             dem_path = legacy_dem
+    # Auto-download DEM if it still doesn't exist
+    if not args.dem and not os.path.exists(dem_path):
+        print(f"DEM not found for '{country_name}'. Running download_data.py automatically...\n")
+        download_script = os.path.join(SCRIPT_DIR, "download_data.py")
+        if not os.path.exists(download_script):
+            print("ERROR: download_data.py not found.")
+            sys.exit(1)
+        dl_cmd = [sys.executable, download_script, country_name,
+                  "--dem-size", f"{int(WIDTH * RESIZED_MAX_SCALE)}x{int(HEIGHT * RESIZED_MAX_SCALE)}"]
+        print(f"  Command: {' '.join(dl_cmd)}\n")
+        dl_result = subprocess.run(dl_cmd)
+        if dl_result.returncode != 0:
+            print("ERROR: download_data.py failed.")
+            sys.exit(1)
+        # Re-resolve DEM path after download
+        dem_path = default_dem
+        if not args.full_res:
+            resized_dem = find_resized_dem(country_dir, country_slug,
+                                          int(WIDTH * RESIZED_MAX_SCALE),
+                                          int(HEIGHT * RESIZED_MAX_SCALE))
+            if resized_dem:
+                print(f"Note: using resized DEM: {resized_dem}")
+                dem_path = resized_dem
+        if not os.path.exists(dem_path):
+            print(f"ERROR: DEM still not found after download: {dem_path}")
+            sys.exit(1)
+        print()
     dem_tag = country_slug
     if dem_path != default_dem:
         dem_base = os.path.splitext(os.path.basename(dem_path))[0]
