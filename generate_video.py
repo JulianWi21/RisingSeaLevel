@@ -21,6 +21,8 @@ import subprocess
 from scipy.ndimage import binary_dilation as scipy_binary_dilation
 import torch
 import torch.nn.functional as F
+from static_ffmpeg import run
+ffmpeg_path, ffprobe_path = run.get_or_fetch_platform_executables_else_raise()
 
 # === Configuration ===
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -768,9 +770,15 @@ def render_frame_gpu(dem_gpu, is_nodata_gpu, sea_level, terrain_lut_gpu,
                      rivers_mask_gpu, lakes_mask_gpu, lake_rim_weight_gpu,
                      hillshade_gpu, ocean_noise_gpu, shore_t, deep_t, river_t, deep_bg_t):
     """Render a single frame entirely on GPU. Returns HxWx3 float tensor on GPU."""
-    # Masks — areas below 0m are protected by dams until sea_level > FLOOD_PROTECTION_M
-    is_land = (~is_nodata_gpu) & (dem_gpu >= sea_level)
-    is_flooded = (~is_nodata_gpu) & (dem_gpu < sea_level)
+    # Masks with sub-pixel interpolation for smooth water rise
+    # DEM data typically has 1m vertical resolution, so we interpolate between integer meters
+    BLEND_RANGE = 1.0  # meters - blend zone around sea_level for smooth transitions
+    
+    # Hard masks for pixels far from waterline
+    is_land = (~is_nodata_gpu) & (dem_gpu >= sea_level + BLEND_RANGE)
+    is_flooded = (~is_nodata_gpu) & (dem_gpu < sea_level - BLEND_RANGE)
+    # Transition zone: pixels near sea_level get alpha blended
+    is_transition = (~is_nodata_gpu) & (dem_gpu >= sea_level - BLEND_RANGE) & (dem_gpu < sea_level + BLEND_RANGE)
     # Output image
     img = torch.zeros_like(hillshade_gpu).unsqueeze(2).expand(-1, -1, 3).contiguous()
     img = img * 0  # zero it out, keep shape
@@ -806,6 +814,28 @@ def render_frame_gpu(dem_gpu, is_nodata_gpu, sea_level, terrain_lut_gpu,
         water_depth = sea_level - dem_gpu[is_flooded_nolake]
         depth_norm = torch.clamp(water_depth / max_vis_depth, 0.0, 1.0).unsqueeze(1)
         img[is_flooded_nolake] = shore_t * (1 - depth_norm) + deep_t * depth_norm
+    
+    # Transition zone: blend between land and water for smooth animation
+    if torch.any(is_transition):
+        # Calculate alpha based on how close dem_gpu is to sea_level
+        # alpha = 0 (land) when dem = sea_level + BLEND_RANGE
+        # alpha = 1 (water) when dem = sea_level - BLEND_RANGE
+        transition_pixels = dem_gpu[is_transition]
+        alpha = 1.0 - torch.clamp((transition_pixels - (sea_level - BLEND_RANGE)) / (2 * BLEND_RANGE), 0.0, 1.0)
+        alpha = alpha.unsqueeze(1)
+        
+        # Get land color for transition pixels
+        land_elev_trans = torch.clamp(transition_pixels - sea_level, 0, 3000).to(torch.int64)
+        land_color = terrain_lut_gpu[land_elev_trans].float()
+        
+        # Get water color for transition pixels
+        water_depth = sea_level - transition_pixels
+        max_vis_depth = max(50.0, sea_level * 0.5)
+        depth_norm = torch.clamp(water_depth / max_vis_depth, 0.0, 1.0).unsqueeze(1)
+        water_color = shore_t * (1 - depth_norm) + deep_t * depth_norm
+        
+        # Blend land and water
+        img[is_transition] = land_color * (1 - alpha) + water_color * alpha
 
     # Rivers on land only (disappear when flooded)
     if rivers_mask_gpu is not None:
@@ -1094,10 +1124,15 @@ def main():
         else:
             sea_max = dem_elev_max
     sea_step = float(args.sea_step)
+    rise_frames_from_duration = None
     if args.duration is not None:
-        total_frames_target = max(2, int(round(args.duration * FPS)))
-        sea_step = max(0.001, (sea_max - sea_min) / (total_frames_target - 1))
-        print(f"Duration {args.duration}s -> {total_frames_target} frames, sea_step={sea_step:.3f}m")
+        # Calculate rise_frames directly from duration
+        fade_and_hold = FADE_DURATION_SEC + HOLD_START_SEC + HOLD_END_SEC + FADE_DURATION_SEC
+        rise_duration = max(0.1, args.duration - fade_and_hold)
+        rise_frames_from_duration = max(2, int(round(rise_duration * FPS)))
+        # Also update sea_step for compatibility with old code
+        sea_step = max(0.001, (sea_max - sea_min) / (rise_frames_from_duration - 1))
+        print(f"Duration {args.duration}s -> rise: {rise_duration:.1f}s = {rise_frames_from_duration} frames, sea_step={sea_step:.3f}m")
     if sea_step <= 0:
         print("ERROR: --sea-step must be > 0.")
         sys.exit(1)
@@ -1105,7 +1140,7 @@ def main():
         print("ERROR: --sea-max must be >= --sea-min.")
         sys.exit(1)
     sea_levels = build_sea_levels(sea_min, sea_max, sea_step, args.sea_curve)
-    rise_frames = len(sea_levels)
+    rise_frames = rise_frames_from_duration if rise_frames_from_duration is not None else len(sea_levels)
     fade_in_frames = int(FADE_DURATION_SEC * FPS)
     hold_start_frames = int(HOLD_START_SEC * FPS)
     hold_end_frames = int(HOLD_END_SEC * FPS)
@@ -1227,9 +1262,11 @@ def main():
         return
 
     # Start ffmpeg pipe - write raw RGB frames directly
+
     print("\nStarting ffmpeg pipe...")
     ffmpeg_cmd = [
-        "ffmpeg", "-y",
+        ffmpeg_path,  # <--- Benutze jetzt die Variable statt "ffmpeg"
+        "-y",
         "-f", "rawvideo",
         "-vcodec", "rawvideo",
         "-s", f"{WIDTH}x{HEIGHT}",
@@ -1259,24 +1296,40 @@ def main():
     # phase5 = fade-out until total_frames
 
     last_img_gpu = None  # cache for hold phases
+    last_sea_level = None  # track sea level changes
 
     for i in range(total_frames):
         # Determine sea level for this frame
         if i < phase2_end:
             sl = sea_min          # fade-in + hold-start: stay at sea_min
-            rise_idx = 0
         elif i < phase3_end:
+            # Interpolate smoothly for every frame during rise
             rise_idx = i - phase2_end
-            sl = float(sea_levels[rise_idx])
+            # Calculate exact position in rise phase (0.0 to 1.0)
+            progress = rise_idx / max(1, rise_frames - 1)
+            # Apply curve transformation to progress
+            if args.sea_curve == "easein":
+                shaped = 0.1 * progress + 0.9 * progress ** 2
+            elif args.sea_curve == "easein2":
+                shaped = 0.05 * progress + 0.95 * progress ** 3
+            elif args.sea_curve == "quadratic":
+                shaped = progress ** 2
+            elif args.sea_curve == "cubic":
+                shaped = progress ** 3
+            elif args.sea_curve == "log":
+                k = 9.0
+                shaped = np.log1p(k * progress) / np.log1p(k)
+            else:
+                shaped = progress
+            # Now interpolate sea level using shaped progress
+            sl = sea_min + (sea_max - sea_min) * shaped
         else:
             sl = sea_max          # hold-end + fade-out: stay at sea_max
-            rise_idx = rise_frames - 1
 
-        # Only re-render when sea level actually changes
-        need_render = (last_img_gpu is None
-                       or (i >= phase2_end and i < phase3_end)  # during rise
-                       or i == phase2_end  # first rise frame
-                       or i == phase3_end) # first hold-end frame
+        # During rise phase, render every single frame for smooth animation
+        # Only use caching during hold phases
+        need_render = (last_img_gpu is None 
+                      or (i >= phase2_end and i < phase3_end))  # Always render during rise
         if need_render:
             img_gpu = render_frame_gpu(
                 dem_gpu, is_nodata_gpu, sl, terrain_lut_gpu,
@@ -1287,6 +1340,7 @@ def main():
             cached_frame = bg_array.copy()
             cached_frame[off_y:off_y + new_h, off_x:off_x + new_w] = img_small
             last_img_gpu = cached_frame
+            last_sea_level = sl  # Update tracked sea level
 
         # Compose frame
         frame_array = last_img_gpu.copy()
@@ -1319,7 +1373,8 @@ def main():
             fps_actual = (i + 1) / elapsed if elapsed > 0 else 0
             eta = (total_frames - i - 1) / fps_actual if fps_actual > 0 else 0
             pct = (i + 1) / total_frames * 100
-            print(f"  Frame {i + 1}/{total_frames} ({pct:.0f}%) - {sl:.0f}m - "
+            render_status = "rendered" if need_render else "cached"
+            print(f"  Frame {i + 1}/{total_frames} ({pct:.0f}%) - {sl:.2f}m ({render_status}) - "
                   f"{fps_actual:.1f} fps - ETA {eta:.0f}s")
 
     # Close ffmpeg
