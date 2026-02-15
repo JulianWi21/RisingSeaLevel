@@ -438,7 +438,7 @@ def resolve_city_label_positions(cities, font_city):
         return
     s = UI_SCALE
     pad = int(3 * s)
-    offset = int(8 * s)
+    offset = int(12 * s)  # Fixed offset for all labels
 
     placed_boxes = []  # (x1, y1, x2, y2) of already-placed labels + dots
 
@@ -455,16 +455,13 @@ def resolve_city_label_positions(cities, font_city):
         tw = bbox[2] - bbox[0]
         th = bbox[3] - bbox[1]
 
-        # 8 candidate offsets (dx, dy) relative to dot
+        # Prefer right position, then try others with SAME offset distance
+        # All positions are at the same distance from marker
         candidates = [
-            ( offset,             -th // 2),            # right
+            ( offset,             -th // 2),            # right (PREFERRED)
             (-offset - tw,        -th // 2),            # left
             (-tw // 2,            -offset - th),        # above
             (-tw // 2,             offset),             # below
-            ( offset,             -offset - th),        # upper-right
-            ( offset,              offset),             # lower-right
-            (-offset - tw,        -offset - th),        # upper-left
-            (-offset - tw,         offset),             # lower-left
         ]
 
         best_pos = None
@@ -600,6 +597,118 @@ def project_mountains_to_frame(mountains, dem_path, new_w, new_h, off_x, off_y):
     return mountains
 
 
+def remove_overlapping_labels(cities, mountains, font_city, font_mt):
+    """Remove cities and mountains that overlap or are too close to each other.
+    Priority: larger cities and higher mountains are kept."""
+    MIN_DISTANCE = 80  # Minimum pixel distance between any two labels
+    s = UI_SCALE
+    pad = int(3 * s)
+    
+    # Create list of all items with their priority
+    items = []
+    
+    # Add cities (priority = population)
+    if cities:
+        dot_r = max(2, int(4 * s)) + pad
+        for city in cities:
+            if "label_x" not in city or "label_y" not in city:
+                continue
+            fx, fy = city["frame_x"], city["frame_y"]
+            lx, ly = city["label_x"], city["label_y"]
+            bbox = font_city.getbbox(city["name"]) if font_city else [0, 0, 50, 20]
+            tw = bbox[2] - bbox[0]
+            th = bbox[3] - bbox[1]
+            
+            # Bounding box includes dot + label
+            marker_box = (fx - dot_r, fy - dot_r, fx + dot_r, fy + dot_r)
+            label_box = (lx - pad, ly - pad, lx + tw + pad, ly + th + pad)
+            full_box = (
+                min(marker_box[0], label_box[0]),
+                min(marker_box[1], label_box[1]),
+                max(marker_box[2], label_box[2]),
+                max(marker_box[3], label_box[3])
+            )
+            
+            items.append({
+                'type': 'city',
+                'data': city,
+                'priority': city.get('pop', 0),  # Higher population = higher priority
+                'box': full_box,
+                'center': (fx, fy)
+            })
+    
+    # Add mountains (priority = elevation)
+    if mountains:
+        tri_half = max(3, int(5 * s)) + pad
+        for mt in mountains:
+            if "label_x" not in mt or "label_y" not in mt:
+                continue
+            fx, fy = mt["frame_x"], mt["frame_y"]
+            lx, ly = mt["label_x"], mt["label_y"]
+            name = mt.get("display_name", mt["name"])
+            bbox = font_mt.getbbox(name) if font_mt else [0, 0, 100, 20]
+            tw = bbox[2] - bbox[0]
+            th = bbox[3] - bbox[1]
+            
+            marker_box = (fx - tri_half, fy - tri_half, fx + tri_half, fy + tri_half)
+            label_box = (lx - pad, ly - pad, lx + tw + pad, ly + th + pad)
+            full_box = (
+                min(marker_box[0], label_box[0]),
+                min(marker_box[1], label_box[1]),
+                max(marker_box[2], label_box[2]),
+                max(marker_box[3], label_box[3])
+            )
+            
+            items.append({
+                'type': 'mountain',
+                'data': mt,
+                'priority': mt.get('catalog_elev', 0),  # Higher elevation = higher priority
+                'box': full_box,
+                'center': (fx, fy)
+            })
+    
+    # Sort by priority (descending)
+    items.sort(key=lambda x: x['priority'], reverse=True)
+    
+    # Filter: keep items that don't overlap with already kept items
+    kept_items = []
+    for item in items:
+        overlaps = False
+        for kept in kept_items:
+            # Check bounding box overlap
+            box1 = item['box']
+            box2 = kept['box']
+            if not (box1[2] < box2[0] or box1[0] > box2[2] or 
+                    box1[3] < box2[1] or box1[1] > box2[3]):
+                overlaps = True
+                break
+            
+            # Check minimum distance between centers
+            dx = item['center'][0] - kept['center'][0]
+            dy = item['center'][1] - kept['center'][1]
+            dist = (dx*dx + dy*dy) ** 0.5
+            if dist < MIN_DISTANCE:
+                overlaps = True
+                break
+        
+        if not overlaps:
+            kept_items.append(item)
+    
+    # Rebuild city and mountain lists
+    filtered_cities = [item['data'] for item in kept_items if item['type'] == 'city']
+    filtered_mountains = [item['data'] for item in kept_items if item['type'] == 'mountain']
+    
+    removed_cities = len(cities) - len(filtered_cities) if cities else 0
+    removed_mountains = len(mountains) - len(filtered_mountains) if mountains else 0
+    
+    if removed_cities > 0:
+        print(f"  Removed {removed_cities} overlapping cities")
+    if removed_mountains > 0:
+        print(f"  Removed {removed_mountains} overlapping mountains")
+    
+    return filtered_cities, filtered_mountains
+
+
 def resolve_mountain_label_positions(mountains, cities, font_mt):
     """Pre-compute non-overlapping label positions for mountains,
     taking existing city markers and labels into account."""
@@ -607,7 +716,7 @@ def resolve_mountain_label_positions(mountains, cities, font_mt):
         return
     s = UI_SCALE
     pad = int(3 * s)
-    offset = int(8 * s)
+    offset = int(12 * s)  # Same offset as cities for consistent appearance
     tri_half = max(3, int(5 * s))
 
     # Start with placed_boxes from cities (dots + labels)
@@ -639,15 +748,12 @@ def resolve_mountain_label_positions(mountains, cities, font_mt):
         tw = bbox[2] - bbox[0]
         th = bbox[3] - bbox[1]
 
+        # Use same offset as cities for consistency, prefer right position
         candidates = [
-            ( offset,             -th // 2),
-            (-offset - tw,        -th // 2),
-            (-tw // 2,            -offset - th),
-            (-tw // 2,             offset),
-            ( offset,             -offset - th),
-            ( offset,              offset),
-            (-offset - tw,        -offset - th),
-            (-offset - tw,         offset),
+            ( offset,             -th // 2),            # right (PREFERRED)
+            (-offset - tw,        -th // 2),            # left
+            (-tw // 2,            -offset - th),        # above
+            (-tw // 2,             offset),             # below
         ]
 
         best_pos = None
@@ -1194,6 +1300,11 @@ def main():
         mountain_data = load_mountains(country_name, dem_path, args.mountains)
         mountain_data = project_mountains_to_frame(mountain_data, dem_path, new_w, new_h, off_x, off_y)
         resolve_mountain_label_positions(mountain_data, city_data, font_mt)
+    
+    # Remove overlapping cities and mountains
+    if city_data or mountain_data:
+        print("Filtering overlapping labels...")
+        city_data, mountain_data = remove_overlapping_labels(city_data, mountain_data, font_city, font_mt)
 
     # Pre-render background frame
     bg_frame = Image.new('RGB', (WIDTH, HEIGHT), tuple(OCEAN_COLOR_DEEP))
