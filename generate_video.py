@@ -1215,7 +1215,7 @@ def main():
         frame_array[off_y:off_y + new_h, off_x:off_x + new_w] = img_small
 
         frame_img = Image.fromarray(frame_array)
-        draw_text_on_frame(frame_img, sl, fonts, sea_min, sea_max)
+        #draw_text_on_frame(frame_img, sl, fonts, sea_min, sea_max)
         if city_data and font_city:
             draw = ImageDraw.Draw(frame_img)
             draw_cities_on_frame(draw, city_data, sl, font_city)
