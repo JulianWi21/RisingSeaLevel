@@ -170,7 +170,7 @@
     {"name": "Mount Tai", "lat": 36.2553, "lon": 117.1053, "elev": 1545},
     {"name": "Mount Hua", "lat": 34.4833, "lon": 110.0833, "elev": 2155},
     {"name": "Jade Dragon Snow Mountain", "lat": 27.0989, "lon": 100.1747, "elev": 5596},
-    {"name": "Meili Snow Mountain", "lat": 28.4356, "lon": 98.7917, "elev": 6740}
+    {"name": "Mount Everest", "lat": 27.9881, "lon": 86.9250, "elev": 8848}
   ],
   "indonesia": [
     {"name": "Puncak Jaya", "lat": -4.0844, "lon": 137.1867, "elev": 4884},

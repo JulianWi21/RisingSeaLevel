@@ -255,13 +255,13 @@
     {"name": "Shanghai", "lat": 31.2304, "lon": 121.4737, "pop": 24870000},
     {"name": "Beijing", "lat": 39.9042, "lon": 116.4074, "pop": 21893000},
     {"name": "Guangzhou", "lat": 23.1291, "lon": 113.2644, "pop": 18676000},
-    {"name": "Shenzhen", "lat": 22.5431, "lon": 114.0579, "pop": 17560000},
     {"name": "Chengdu", "lat": 30.5728, "lon": 104.0668, "pop": 20937000},
     {"name": "Chongqing", "lat": 29.5630, "lon": 106.5516, "pop": 32054000},
-    {"name": "Tianjin", "lat": 39.1257, "lon": 117.1901, "pop": 13866000},
     {"name": "Wuhan", "lat": 30.5928, "lon": 114.3055, "pop": 12326000},
     {"name": "Xi'an", "lat": 34.3416, "lon": 108.9398, "pop": 12180000},
-    {"name": "Hangzhou", "lat": 30.2741, "lon": 120.1551, "pop": 11936000}
+    {"name": "Harbin", "lat": 45.7567, "lon": 126.6424, "pop": 10009000},
+    {"name": "Urumqi", "lat": 43.8256, "lon": 87.6168, "pop": 4054000},
+    {"name": "Lhasa", "lat": 29.6469, "lon": 91.1172, "pop": 867000}
   ],
   "indonesia": [
     {"name": "Jakarta", "lat": -6.2088, "lon": 106.8456, "pop": 10562000},

@@ -43,8 +43,8 @@ for _candidate in [_anaconda_lib_bin,
         break
 
 # Video settings
-WIDTH = 1920
-HEIGHT = 1080
+WIDTH = 3840  # 4K resolution
+HEIGHT = 2160  # 4K resolution
 FPS = 60
 DEFAULT_DURATION = 90  # seconds of sea-level rise
 RESIZED_MAX_SCALE = 2.0  # default: pick resized DEM up to 2x video size
@@ -1014,10 +1014,13 @@ def parse_args():
                         help="Sea-level growth curve over time (default: easein). easein2 = stronger acceleration.")
     parser.add_argument("--ui-tick-step", type=int, default=None,
                         help="Fixed tick step (meters) for the bottom scale. Default: auto.")
+    parser.add_argument("--resolution", type=str, default=None,
+                        choices=["720p", "1080p", "1440p", "4k", "8k"],
+                        help="Video resolution preset (720p=1280x720, 1080p=1920x1080, 1440p=2560x1440, 4k=3840x2160, 8k=7680x4320).")
     parser.add_argument("--width", type=int, default=None,
-                        help="Video width in pixels (default: 3840).")
+                        help="Video width in pixels (default: 3840). Overrides --resolution.")
     parser.add_argument("--height", type=int, default=None,
-                        help="Video height in pixels (default: 2160).")
+                        help="Video height in pixels (default: 2160). Overrides --resolution.")
     parser.add_argument("--fps", type=int, default=None,
                         help="Frames per second (default: 60).")
     parser.add_argument("--duration", type=float, default=DEFAULT_DURATION,
@@ -1060,6 +1063,20 @@ def main():
         print("Warning: both positional and --country provided; using --country.")
     # Override globals if CLI args provided
     global WIDTH, HEIGHT, FPS, UI_SCALE
+    
+    # Resolution presets
+    if args.resolution is not None:
+        resolution_presets = {
+            "720p": (1280, 720),
+            "1080p": (1920, 1080),
+            "1440p": (2560, 1440),
+            "4k": (3840, 2160),
+            "8k": (7680, 4320)
+        }
+        WIDTH, HEIGHT = resolution_presets[args.resolution]
+        print(f"Using resolution preset: {args.resolution} ({WIDTH}x{HEIGHT})")
+    
+    # Individual width/height override resolution preset
     if args.width is not None:
         WIDTH = args.width
     if args.height is not None:
